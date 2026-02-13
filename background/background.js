@@ -96,6 +96,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'GET_SETTINGS':
       getSettings().then(sendResponse);
       return true; // async
+
+    case 'FETCH_IMAGE':
+      fetchImageAsDataUrl(message.url)
+        .then(sendResponse)
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true; // async
   }
 });
 
@@ -131,4 +137,34 @@ async function getSettings() {
     sensitivity: result.sensitivity ?? 50,
     categories: result.categories ?? { porn: true, sexy: true, hentai: true }
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ПРОКСИ-ЗАГРУЗКА ИЗОБРАЖЕНИЙ (обходит CORS)
+// ═══════════════════════════════════════════════════════════════
+// Service worker не подчиняется CORS-политике страницы,
+// поэтому может загрузить изображение с любого домена.
+
+async function fetchImageAsDataUrl(url) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return { success: false, error: `HTTP ${response.status}` };
+
+    const blob = await response.blob();
+    if (!blob.type.startsWith('image/')) return { success: false, error: 'Not an image' };
+
+    // Конвертируем blob → base64 data URL
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const base64 = btoa(binary);
+    const dataUrl = `data:${blob.type};base64,${base64}`;
+
+    return { success: true, dataUrl };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 }

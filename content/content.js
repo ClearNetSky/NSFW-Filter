@@ -203,20 +203,17 @@
     }
   }
 
-  // Fetch cross-origin image as data URL via background-safe fetch
+  // Fetch cross-origin image as data URL via background service worker
+  // Background SW не подчиняется CORS-политике страницы,
+  // поэтому может загрузить изображения с любого домена (DuckDuckGo, Bing и т.д.)
   async function fetchImageAsDataUrl(url) {
     try {
-      const response = await fetch(url, { mode: 'cors' });
-      if (!response.ok) return null;
-      const blob = await response.blob();
-      if (!blob.type.startsWith('image/')) return null;
-      
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = () => resolve(null);
-        reader.readAsDataURL(blob);
+      const response = await chrome.runtime.sendMessage({
+        type: 'FETCH_IMAGE',
+        url
       });
+      if (response && response.success) return response.dataUrl;
+      return null;
     } catch {
       return null;
     }
