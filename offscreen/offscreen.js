@@ -34,6 +34,20 @@ window.addEventListener('message', (event) => {
     case 'CLASSIFY_RESULT':
       resolvePending(data.id, data);
       break;
+
+    case 'CONTEXT_LOST':
+      // WebGL контекст потерян — модель нужно будет перезагрузить
+      isModelReady = false;
+      modelLoadPromise = null;
+      console.warn('NSFW Offscreen: WebGL context lost in sandbox');
+      break;
+
+    case 'CONTEXT_RECOVERED':
+      // WebGL контекст восстановлен, модель перезагружена в sandbox
+      isModelReady = true;
+      modelLoadPromise = null;
+      console.log('NSFW Offscreen: WebGL context recovered, model reloaded');
+      break;
   }
 });
 

@@ -1,10 +1,106 @@
 // Sandbox для классификации изображений
 // Работает в изолированном контексте с разрешённым unsafe-eval
 // WebGL backend для GPU-ускоренной классификации
+// Включает автоматическое восстановление при потере WebGL контекста
 
 let model = null;
 let modelLoadPromise = null;
 let backendName = 'unknown';
+let isContextLost = false;
+let isRecovering = false;
+let recoveryPromise = null;
+
+// ═══════════════════════════════════════════════════════════════
+// WEBGL CONTEXT LOSS RECOVERY
+// ═══════════════════════════════════════════════════════════════
+
+// Мониторинг WebGL контекста — обнаружение и восстановление
+function monitorWebGLContext() {
+  if (typeof tf === 'undefined' || tf.getBackend() !== 'webgl') return;
+
+  const backend = tf.backend();
+  const gl = backend?.gpgpu?.gl;
+  if (!gl) return;
+
+  const canvas = gl.canvas;
+  if (!canvas || canvas.__nsfwContextMonitored) return;
+  canvas.__nsfwContextMonitored = true;
+
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault(); // Позволяет браузеру попытаться восстановить контекст
+    isContextLost = true;
+    console.warn('NSFW Sandbox: WebGL context lost — stopping classification');
+    // Уведомляем offscreen document о потере контекста
+    window.parent.postMessage({ type: 'CONTEXT_LOST' }, '*');
+  });
+
+  canvas.addEventListener('webglcontextrestored', () => {
+    console.log('NSFW Sandbox: WebGL context restored — reinitializing...');
+    recoverFromContextLoss();
+  });
+
+  console.log('NSFW Sandbox: WebGL context loss monitor active');
+}
+
+// Полное восстановление: dispose backend → переинициализация → перезагрузка модели
+async function recoverFromContextLoss() {
+  if (isRecovering) return recoveryPromise;
+  isRecovering = true;
+
+  recoveryPromise = (async () => {
+    try {
+      console.log('NSFW Sandbox: Starting recovery...');
+
+      // Сбрасываем модель
+      model = null;
+      modelLoadPromise = null;
+
+      // Диспозим старый backend и заново инициализируем
+      try {
+        tf.engine().reset();
+      } catch (e) {
+        console.warn('NSFW Sandbox: Engine reset warning:', e.message);
+      }
+
+      // Пробуем заново WebGL, если не получится — fallback на CPU
+      try {
+        await tf.setBackend('webgl');
+        await tf.ready();
+        backendName = tf.getBackend();
+      } catch (e) {
+        console.warn('NSFW Sandbox: WebGL recovery failed, falling back to CPU:', e.message);
+        await tf.setBackend('cpu');
+        await tf.ready();
+        backendName = 'cpu';
+      }
+
+      // Перезагружаем модель
+      model = await nsfwjs.load('../models/', { size: 299 });
+
+      isContextLost = false;
+      isRecovering = false;
+      recoveryPromise = null;
+
+      // Мониторим новый контекст
+      monitorWebGLContext();
+
+      console.log(`NSFW Sandbox: Recovery complete (backend: ${backendName})`);
+      window.parent.postMessage({ type: 'CONTEXT_RECOVERED' }, '*');
+      return true;
+    } catch (error) {
+      console.error('NSFW Sandbox: Recovery failed completely:', error);
+      isRecovering = false;
+      recoveryPromise = null;
+      return false;
+    }
+  })();
+
+  return recoveryPromise;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// НАСТРОЙКА WEBGL
+// ═══════════════════════════════════════════════════════════════
 
 // Настройка WebGL backend для максимальной производительности
 async function setupWebGL() {
@@ -36,15 +132,29 @@ async function setupWebGL() {
         tf.env().set('WEBGL_FORCE_F16_TEXTURES', false);
         tf.env().set('WEBGL_PACK', true);
         
+        // Запускаем мониторинг контекста
+        monitorWebGLContext();
+        
         console.log('NSFW Sandbox: WebGL GPU acceleration active');
       }
     } catch (e) {
-      console.warn('NSFW Sandbox: WebGL setup failed, using auto-detect:', e.message);
+      console.warn('NSFW Sandbox: WebGL setup failed, falling back to CPU:', e.message);
+      try {
+        await tf.setBackend('cpu');
+        await tf.ready();
+        backendName = 'cpu';
+        console.log('NSFW Sandbox: CPU backend active (fallback)');
+      } catch (e2) {
+        console.error('NSFW Sandbox: All backends failed:', e2.message);
+      }
     }
   }
 }
 
-// Загрузка модели
+// ═══════════════════════════════════════════════════════════════
+// ЗАГРУЗКА МОДЕЛИ
+// ═══════════════════════════════════════════════════════════════
+
 async function loadModel() {
   if (model) return model;
   if (modelLoadPromise) return modelLoadPromise;
@@ -69,9 +179,27 @@ async function loadModel() {
   return modelLoadPromise;
 }
 
+// Проверка и восстановление перед классификацией
+async function ensureReady() {
+  if (isContextLost || isRecovering) {
+    if (isRecovering) {
+      const ok = await recoveryPromise;
+      if (!ok) throw new Error('WebGL recovery failed');
+    } else {
+      const ok = await recoverFromContextLoss();
+      if (!ok) throw new Error('WebGL recovery failed');
+    }
+  }
+  return loadModel();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// КЛАССИФИКАЦИЯ
+// ═══════════════════════════════════════════════════════════════
+
 // Оптимизированная классификация: принимает ImageBitmap напрямую
 async function classifyFromBitmap(bitmap) {
-  const loadedModel = await loadModel();
+  const loadedModel = await ensureReady();
   if (!loadedModel) throw new Error('Model not available');
   
   // Рисуем bitmap на canvas 299x299 (размер модели)
@@ -92,7 +220,7 @@ async function classifyFromBitmap(bitmap) {
 
 // Фоллбэк: классификация по data URL
 async function classifyFromDataUrl(imageDataUrl) {
-  const loadedModel = await loadModel();
+  const loadedModel = await ensureReady();
   if (!loadedModel) throw new Error('Model not available');
   
   return new Promise((resolve, reject) => {
@@ -113,6 +241,33 @@ async function classifyFromDataUrl(imageDataUrl) {
   });
 }
 
+// Обёртка с автоматическим retry при потере WebGL контекста
+async function classifyWithRecovery(classifyFn) {
+  try {
+    return await classifyFn();
+  } catch (error) {
+    // Если ошибка связана с WebGL контекстом — пробуем восстановить и повторить
+    const msg = error.message || '';
+    const isContextError = isContextLost ||
+      msg.includes('context lost') ||
+      msg.includes('does not belong') ||
+      msg.includes('INVALID_OPERATION') ||
+      msg.includes('no valid shader') ||
+      msg.includes('no texture bound');
+
+    if (isContextError) {
+      console.warn('NSFW Sandbox: WebGL error detected, attempting recovery...');
+      isContextLost = true;
+      const recovered = await recoverFromContextLoss();
+      if (recovered) {
+        // Повторяем классификацию после восстановления
+        return await classifyFn();
+      }
+    }
+    throw error;
+  }
+}
+
 // Обработка сообщений
 window.addEventListener('message', async (event) => {
   const { type, id, imageDataUrl } = event.data;
@@ -121,11 +276,12 @@ window.addEventListener('message', async (event) => {
     try {
       let predictions;
       
-      // Если передан ImageBitmap через transfer
+      // Обёртка с автоматическим восстановлением WebGL контекста
       if (event.data.bitmap) {
-        predictions = await classifyFromBitmap(event.data.bitmap);
+        const bitmap = event.data.bitmap;
+        predictions = await classifyWithRecovery(() => classifyFromBitmap(bitmap));
       } else if (imageDataUrl) {
-        predictions = await classifyFromDataUrl(imageDataUrl);
+        predictions = await classifyWithRecovery(() => classifyFromDataUrl(imageDataUrl));
       } else {
         throw new Error('No image data provided');
       }
