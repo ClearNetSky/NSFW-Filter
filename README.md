@@ -5,7 +5,7 @@
 [![GitHub Issues](https://img.shields.io/github/issues/AristarhUcolov/NSFW-Filter)](https://github.com/AristarhUcolov/NSFW-Filter/issues)
 [![GitHub Release](https://img.shields.io/github/v/release/AristarhUcolov/NSFW-Filter?include_prereleases)](https://github.com/AristarhUcolov/NSFW-Filter/releases)
 [![Chrome Web Store](https://img.shields.io/badge/Chrome-Web%20Store-brightgreen)](https://chromewebstore.google.com/detail/nsfw-filter/nojnjhlhdhfaghkgdgdcobjnoeghkopg)
-[![Version](https://img.shields.io/badge/version-1.4.0-blue)](https://github.com/AristarhUcolov/NSFW-Filter)
+[![Version](https://img.shields.io/badge/version-1.5.0-blue)](https://github.com/AristarhUcolov/NSFW-Filter)
 
 [🇷🇺 Русский](#russian) | [🇬🇧 English](#english)
 
@@ -115,6 +115,11 @@ NSFW-Filter/
 - [NSFWJS](https://github.com/infinitered/nsfwjs) - модель классификации контента
 - Chrome Extension Manifest V3
 ## 📋 История изменений
+
+### v1.5.0
+- 🌐 **Исправлен CORS** — загрузка cross-origin изображений теперь проксируется через background service worker
+- 🔧 Сайты без `Access-Control-Allow-Origin` (DuckDuckGo Images, Bing и др.) теперь корректно сканируются
+- 📝 Полный текст лицензии GPL-3.0 в файле LICENSE
 
 ### v1.4.0
 - 🚀 **WebGL GPU-ускорение** — принудительный WebGL backend с оптимизациями GPU
@@ -271,7 +276,10 @@ NSFW-Filter/
 - Chrome Extension Manifest V3
 
 ## � Changelog
-
+### v1.5.0
+- 🌐 **CORS fix** — cross-origin image fetching now proxied through background service worker
+- 🔧 Sites without `Access-Control-Allow-Origin` (DuckDuckGo Images, Bing, etc.) are now scanned correctly
+- 📝 Full GPL-3.0 license text in LICENSE file
 ### v1.4.0
 - 🚀 **WebGL GPU acceleration** — forced WebGL backend with GPU optimizations
 - ⚡ Disabled unused GL features (DEPTH_TEST, BLEND, etc.)
