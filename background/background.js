@@ -5,6 +5,34 @@
 const OFFSCREEN_PATH = 'offscreen/offscreen.html';
 
 // ═══════════════════════════════════════════════════════════════
+// SERVICE WORKER KEEPALIVE
+// ═══════════════════════════════════════════════════════════════
+// Chrome убивает idle SW через 30 секунд.
+// Поддерживаем SW активным пока идут классификации.
+
+let activeClassifications = 0;
+let keepAliveInterval = null;
+
+function startKeepAlive() {
+  if (keepAliveInterval) return;
+  keepAliveInterval = setInterval(() => {
+    // Простой self-ping для сброса idle timeout Chrome
+    if (activeClassifications > 0) {
+      chrome.runtime.getPlatformInfo(() => {});
+    } else {
+      stopKeepAlive();
+    }
+  }, 25000); // Каждые 25 секунд (timeout = 30s)
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // OFFSCREEN DOCUMENT MANAGEMENT
 // ═══════════════════════════════════════════════════════════════
 
@@ -107,15 +135,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Маршрутизация классификации в offscreen document
 async function handleClassify(message) {
-  await ensureOffscreenDocument();
+  activeClassifications++;
+  startKeepAlive();
+  
+  try {
+    await ensureOffscreenDocument();
 
-  const response = await chrome.runtime.sendMessage({
-    target: 'offscreen',
-    type: 'CLASSIFY_IMAGE',
-    imageDataUrl: message.imageDataUrl
-  });
+    const response = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      type: 'CLASSIFY_IMAGE',
+      imageDataUrl: message.imageDataUrl
+    });
 
-  return response;
+    return response;
+  } finally {
+    activeClassifications--;
+    if (activeClassifications <= 0) {
+      activeClassifications = 0;
+      stopKeepAlive();
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -153,14 +192,18 @@ async function fetchImageAsDataUrl(url) {
     const blob = await response.blob();
     if (!blob.type.startsWith('image/')) return { success: false, error: 'Not an image' };
 
-    // Конвертируем blob → base64 data URL
+    // Конвертируем blob → base64 data URL (chunked для производительности)
     const buffer = await blob.arrayBuffer();
     const bytes = new Uint8Array(buffer);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
+    
+    // Chunk-based encoding — в 10-20x быстрее чем посимвольный String.fromCharCode
+    const chunkSize = 8192;
+    const chunks = [];
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      chunks.push(String.fromCharCode.apply(null, chunk));
     }
-    const base64 = btoa(binary);
+    const base64 = btoa(chunks.join(''));
     const dataUrl = `data:${blob.type};base64,${base64}`;
 
     return { success: true, dataUrl };

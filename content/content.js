@@ -1,6 +1,7 @@
-// NSFW Filter Content Script — v3.0
+// NSFW Filter Content Script — v4.0
 // Централизованная модель через offscreen document (загружается один раз)
 // 5-классовая система NSFWJS: Drawing, Hentai, Neutral, Porn, Sexy
+// v4.0: URL-кэш, CSS background-image, video poster, IntersectionObserver, retry
 
 (async function() {
   'use strict';
@@ -37,6 +38,26 @@
   let isProcessingQueue = false;
   let scanDebounceTimer = null;
 
+  // Кэш результатов классификации по URL — избегаем повторной классификации
+  // одного и того же изображения (например, тот же URL в нескольких <img>)
+  const classificationCache = new Map();
+  const CACHE_MAX_SIZE = 500;   // Максимум записей в кэше
+
+  function getCachedResult(url) {
+    if (!url || url.startsWith('data:')) return null;
+    return classificationCache.get(url) || null;
+  }
+
+  function cacheResult(url, result) {
+    if (!url || url.startsWith('data:')) return;
+    // Очищаем кэш при переполнении (LRU-подобное — удаляем старые)
+    if (classificationCache.size >= CACHE_MAX_SIZE) {
+      const firstKey = classificationCache.keys().next().value;
+      classificationCache.delete(firstKey);
+    }
+    classificationCache.set(url, result);
+  }
+
   // Переиспользуемый canvas для конвертации
   let sharedCanvas = null;
   let sharedCtx = null;
@@ -55,13 +76,39 @@
   // КЛАССИФИКАЦИЯ ЧЕРЕЗ BACKGROUND (модель в offscreen document)
   // ═══════════════════════════════════════════════════════════════
 
+  const MAX_RETRIES = 2;
+  const RETRY_DELAY = 1000; // мс
+
   async function classifyImage(imageDataUrl) {
-    const response = await chrome.runtime.sendMessage({
-      type: 'CLASSIFY_IMAGE',
-      imageDataUrl
-    });
-    if (response && response.success) return response.predictions;
-    throw new Error(response?.error || 'Classification failed');
+    let lastError;
+    
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: 'CLASSIFY_IMAGE',
+          imageDataUrl
+        });
+        if (response && response.success) return response.predictions;
+        throw new Error(response?.error || 'Classification failed');
+      } catch (error) {
+        lastError = error;
+        const msg = error.message || '';
+        
+        // Ошибки связи с SW — retry с задержкой
+        const isDisconnect = msg.includes('disconnected') ||
+          msg.includes('Receiving end does not exist') ||
+          msg.includes('Extension context invalidated') ||
+          msg.includes('message port closed');
+        
+        if (isDisconnect && attempt < MAX_RETRIES) {
+          console.debug(`NSFW Filter: SW disconnected, retry ${attempt + 1}/${MAX_RETRIES}...`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY * (attempt + 1)));
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError;
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -87,23 +134,33 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // СИСТЕМА ОЧЕРЕДЕЙ С ПРИОРИТЕТАМИ
+  // СИСТЕМА ОЧЕРЕДЕЙ С ПРИОРИТЕТАМИ + INTERSECTIONOBSERVER
   // ═══════════════════════════════════════════════════════════════
+
+  // Множество видимых элементов (обновляется IntersectionObserver'ом)
+  const visibleElements = new WeakSet();
+
+  // IntersectionObserver для эффективного отслеживания видимости
+  // Значительно быстрее чем getBoundingClientRect при scroll
+  const visibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        visibleElements.add(entry.target);
+        // Если изображение стало видимым и ещё не обработано — приоритизируем
+        if (!processedImages.has(entry.target) && entry.target.dataset.nsfwBlocked !== 'true') {
+          enqueueImage(entry.target);
+        }
+      } else {
+        visibleElements.delete(entry.target);
+      }
+    }
+  }, {
+    rootMargin: '100% 0px 100% 0px' // 1 экран сверху и снизу
+  });
 
   function isElementVisible(el) {
     if (!CONFIG.VISIBILITY_CHECK) return true;
-    
-    const rect = el.getBoundingClientRect();
-    const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-    const viewWidth = window.innerWidth || document.documentElement.clientWidth;
-    
-    // Изображение в viewport или рядом (1 экран сверху/снизу)
-    return (
-      rect.bottom >= -viewHeight &&
-      rect.top <= viewHeight * 2 &&
-      rect.right >= 0 &&
-      rect.left <= viewWidth
-    );
+    return visibleElements.has(el);
   }
 
   function enqueueImage(img) {
@@ -171,6 +228,19 @@
     processedImages.add(img);
     
     try {
+      // Проверяем кэш результатов по URL
+      const imgUrl = img.src;
+      const cached = getCachedResult(imgUrl);
+      if (cached) {
+        if (cached.shouldBlock) {
+          blockImage(img, cached.reason, cached.category);
+          updateStats(1, 1);
+        } else {
+          updateStats(0, 1);
+        }
+        return;
+      }
+
       // Оптимизированная конвертация: уменьшаем до 299x299
       let imageDataUrl = imageToOptimizedDataUrl(img);
       
@@ -188,6 +258,9 @@
       
       if (predictions) {
         const result = analyzeResults(predictions);
+        
+        // Кэшируем результат по URL
+        cacheResult(imgUrl, result);
         
         if (result.shouldBlock) {
           blockImage(img, result.reason, result.category);
@@ -472,6 +545,9 @@
     const h = img.naturalHeight || img.height;
     if (w < CONFIG.MIN_IMAGE_SIZE && h < CONFIG.MIN_IMAGE_SIZE) return;
 
+    // Регистрируем в IntersectionObserver для отслеживания видимости
+    visibilityObserver.observe(img);
+
     if (img.complete && img.naturalWidth > 0) {
       enqueueImage(img);
     } else {
@@ -489,6 +565,10 @@
       for (let i = 0; i < images.length; i++) {
         handleImage(images[i]);
       }
+      // Сканируем CSS background-image
+      scanBackgroundImages();
+      // Сканируем <video> poster
+      scanVideoPoster();
     }, CONFIG.SCAN_DEBOUNCE);
   }
 
@@ -498,6 +578,189 @@
     for (let i = 0; i < images.length; i++) {
       handleImage(images[i]);
     }
+    // Сканируем CSS background-image
+    scanBackgroundImages();
+    // Сканируем <video> poster
+    scanVideoPoster();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // CSS BACKGROUND-IMAGE СКАНИРОВАНИЕ
+  // ═══════════════════════════════════════════════════════════════
+
+  const processedBgElements = new WeakSet();
+  const bgUrlRegex = /url\(["']?(https?:\/\/[^"')]+)["']?\)/i;
+
+  function scanBackgroundImages() {
+    if (!settings.enabled) return;
+    
+    // Сканируем элементы с inline style background-image
+    const candidates = document.querySelectorAll('[style*="background"]');
+    for (const el of candidates) {
+      handleBackgroundImage(el);
+    }
+    
+    // Сканируем распространённые контейнеры (div, span, a) с computed background
+    // Ограничиваем для производительности — только видимые элементы разумного размера
+    const containers = document.querySelectorAll('div[class], a[class], span[class]');
+    for (const el of containers) {
+      if (!processedBgElements.has(el) && isElementVisible(el)) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width >= CONFIG.MIN_IMAGE_SIZE && rect.height >= CONFIG.MIN_IMAGE_SIZE) {
+          const computed = getComputedStyle(el);
+          if (computed.backgroundImage && computed.backgroundImage !== 'none') {
+            handleBackgroundImage(el);
+          }
+        }
+      }
+    }
+  }
+
+  function handleBackgroundImage(el) {
+    if (processedBgElements.has(el)) return;
+    if (el.dataset.nsfwBgBlocked === 'true') return;
+    
+    const style = el.style.backgroundImage || getComputedStyle(el).backgroundImage;
+    if (!style || style === 'none') return;
+    
+    const match = style.match(bgUrlRegex);
+    if (!match) return;
+    
+    const url = match[1];
+    if (!url) return;
+    
+    processedBgElements.add(el);
+    
+    // Проверяем кэш
+    const cached = getCachedResult(url);
+    if (cached) {
+      if (cached.shouldBlock) {
+        blockBackgroundElement(el, cached.reason, cached.category);
+        updateStats(1, 1);
+      } else {
+        updateStats(0, 1);
+      }
+      return;
+    }
+    
+    // Загружаем и классифицируем
+    activeTasks++;
+    (async () => {
+      try {
+        const imageDataUrl = await fetchImageAsDataUrl(url);
+        if (!imageDataUrl) return;
+        
+        const predictions = await classifyImage(imageDataUrl);
+        if (predictions) {
+          const result = analyzeResults(predictions);
+          cacheResult(url, result);
+          
+          if (result.shouldBlock) {
+            blockBackgroundElement(el, result.reason, result.category);
+            updateStats(1, 1);
+          } else {
+            updateStats(0, 1);
+          }
+        }
+      } catch (error) {
+        processedBgElements.delete(el);
+        console.debug('NSFW Filter: Background image error', error.message);
+      } finally {
+        activeTasks--;
+        if (imageQueue.length > 0) drainQueue();
+      }
+    })();
+  }
+
+  function blockBackgroundElement(el, reason, category) {
+    el.dataset.nsfwBgOriginal = el.style.backgroundImage || '';
+    el.dataset.nsfwBgBlocked = 'true';
+    el.dataset.nsfwReason = reason;
+    el.dataset.nsfwCategory = category;
+    
+    el.style.backgroundImage = 'none';
+    el.style.backgroundColor = '#f5f5f5';
+    
+    console.log(`NSFW Filter: Blocked background [${category}] (${reason})`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // VIDEO POSTER СКАНИРОВАНИЕ
+  // ═══════════════════════════════════════════════════════════════
+
+  const processedVideos = new WeakSet();
+
+  function scanVideoPoster() {
+    if (!settings.enabled) return;
+    
+    const videos = document.querySelectorAll('video[poster]');
+    for (const video of videos) {
+      handleVideoPoster(video);
+    }
+  }
+
+  function handleVideoPoster(video) {
+    if (processedVideos.has(video)) return;
+    if (video.dataset.nsfwPosterBlocked === 'true') return;
+    
+    const posterUrl = video.poster;
+    if (!posterUrl || (!posterUrl.startsWith('http://') && !posterUrl.startsWith('https://'))) return;
+    
+    const rect = video.getBoundingClientRect();
+    if (rect.width < CONFIG.MIN_IMAGE_SIZE || rect.height < CONFIG.MIN_IMAGE_SIZE) return;
+    
+    processedVideos.add(video);
+    
+    // Проверяем кэш
+    const cached = getCachedResult(posterUrl);
+    if (cached) {
+      if (cached.shouldBlock) {
+        blockVideoPoster(video, cached.reason, cached.category);
+        updateStats(1, 1);
+      } else {
+        updateStats(0, 1);
+      }
+      return;
+    }
+    
+    activeTasks++;
+    (async () => {
+      try {
+        const imageDataUrl = await fetchImageAsDataUrl(posterUrl);
+        if (!imageDataUrl) return;
+        
+        const predictions = await classifyImage(imageDataUrl);
+        if (predictions) {
+          const result = analyzeResults(predictions);
+          cacheResult(posterUrl, result);
+          
+          if (result.shouldBlock) {
+            blockVideoPoster(video, result.reason, result.category);
+            updateStats(1, 1);
+          } else {
+            updateStats(0, 1);
+          }
+        }
+      } catch (error) {
+        processedVideos.delete(video);
+        console.debug('NSFW Filter: Video poster error', error.message);
+      } finally {
+        activeTasks--;
+        if (imageQueue.length > 0) drainQueue();
+      }
+    })();
+  }
+
+  function blockVideoPoster(video, reason, category) {
+    video.dataset.nsfwPosterOriginal = video.poster;
+    video.dataset.nsfwPosterBlocked = 'true';
+    video.dataset.nsfwReason = reason;
+    video.dataset.nsfwCategory = category;
+    
+    video.removeAttribute('poster');
+    video.style.backgroundColor = '#f5f5f5';
+    
+    console.log(`NSFW Filter: Blocked video poster [${category}] (${reason})`);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -520,14 +783,29 @@
   const observer = new MutationObserver((mutations) => {
     if (!settings.enabled) return;
     
+    let needsBgScan = false;
+    let needsVideoScan = false;
+    
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
         if (node.nodeName === 'IMG') {
           mutationBatch.push(node);
+        } else if (node.nodeName === 'VIDEO' && node.poster) {
+          needsVideoScan = true;
         } else if (node.querySelectorAll) {
           const imgs = node.querySelectorAll('img');
           for (let i = 0; i < imgs.length; i++) {
             mutationBatch.push(imgs[i]);
+          }
+          // Проверяем элементы с background-image
+          if (node.style && node.style.backgroundImage && node.style.backgroundImage !== 'none') {
+            needsBgScan = true;
+          }
+          if (node.querySelectorAll('[style*="background"]').length > 0) {
+            needsBgScan = true;
+          }
+          if (node.querySelectorAll('video[poster]').length > 0) {
+            needsVideoScan = true;
           }
         }
       }
@@ -539,11 +817,30 @@
           mutationBatch.push(img);
         }
       }
+      
+      // Отслеживаем изменения style (background-image)
+      if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+        const el = mutation.target;
+        if (el.style.backgroundImage && el.style.backgroundImage !== 'none') {
+          needsBgScan = true;
+        }
+      }
     }
     
     // Батчим обработку мутаций
     if (mutationBatch.length > 0 && !mutationTimer) {
       mutationTimer = setTimeout(processMutationBatch, 16); // ~1 frame
+    }
+    
+    // Запускаем сканирование background-image и video poster с дебаунсом
+    if (needsBgScan) {
+      clearTimeout(scanDebounceTimer);
+      scanDebounceTimer = setTimeout(() => {
+        scanBackgroundImages();
+      }, CONFIG.SCAN_DEBOUNCE);
+    }
+    if (needsVideoScan) {
+      setTimeout(scanVideoPoster, CONFIG.SCAN_DEBOUNCE);
     }
   });
 
@@ -567,11 +864,36 @@
             processedImages.delete(img);
           }
         });
+        // Разблокируем CSS background-image
+        document.querySelectorAll('[data-nsfw-bg-blocked="true"]').forEach(el => {
+          if (el.dataset.nsfwBgOriginal) {
+            el.style.backgroundImage = el.dataset.nsfwBgOriginal;
+            el.style.backgroundColor = '';
+          }
+          delete el.dataset.nsfwBgBlocked;
+          delete el.dataset.nsfwBgOriginal;
+          delete el.dataset.nsfwReason;
+          delete el.dataset.nsfwCategory;
+          processedBgElements.delete(el);
+        });
+        // Разблокируем video poster
+        document.querySelectorAll('video[data-nsfw-poster-blocked="true"]').forEach(video => {
+          if (video.dataset.nsfwPosterOriginal) {
+            video.poster = video.dataset.nsfwPosterOriginal;
+            video.style.backgroundColor = '';
+          }
+          delete video.dataset.nsfwPosterBlocked;
+          delete video.dataset.nsfwPosterOriginal;
+          delete video.dataset.nsfwReason;
+          delete video.dataset.nsfwCategory;
+          processedVideos.delete(video);
+        });
       } else {
         // Перепроверяем с новыми настройками
         processedImages = new WeakSet();
         imageQueue = [];
         placeholderCache.clear();
+        classificationCache.clear(); // Сбрасываем кэш при смене настроек
         scanPageImmediate();
       }
     }
@@ -589,7 +911,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['src']
+      attributeFilter: ['src', 'style', 'poster']
     });
     
     // Приоритизируем видимые изображения при первом скане
@@ -611,7 +933,7 @@
       }, 300);
     }, { passive: true });
     
-    console.log('NSFW Filter v3.0: Initialized (centralized model)');
+    console.log('NSFW Filter v4.0: Initialized (centralized model)');
   }
 
   init();
