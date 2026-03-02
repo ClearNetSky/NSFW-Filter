@@ -250,96 +250,6 @@ h1 {
   padding-top: 10px;
 }
 
-/* Whitelist */
-.whitelist-section {
-  margin-bottom: 10px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid #eee;
-}
-
-.whitelist-header {
-  font-weight: 500;
-  font-size: 13px;
-  margin-bottom: 6px;
-}
-
-.whitelist-controls {
-  display: flex;
-  gap: 6px;
-}
-
-.btn-whitelist {
-  flex: 1;
-  background: linear-gradient(135deg, #43A047 0%, #388E3C 100%);
-  color: white;
-  border: none;
-  padding: 6px 12px;
-  border-radius: 8px;
-  font-size: 11px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-family: inherit;
-}
-
-.btn-whitelist:hover {
-  box-shadow: 0 2px 8px rgba(67, 160, 71, 0.4);
-}
-
-.btn-whitelist:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.whitelist-status {
-  font-size: 10px;
-  color: #43A047;
-  margin-top: 4px;
-  text-align: center;
-}
-
-.whitelist-status.hidden {
-  display: none;
-}
-
-.whitelist-list {
-  margin-top: 6px;
-  max-height: 80px;
-  overflow-y: auto;
-}
-
-.whitelist-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 3px 0;
-  font-size: 11px;
-  color: #555;
-}
-
-.whitelist-item .domain {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.whitelist-remove {
-  background: none;
-  border: none;
-  color: #e53935;
-  cursor: pointer;
-  font-size: 14px;
-  padding: 0 4px;
-  line-height: 1;
-  opacity: 0.6;
-  transition: opacity 0.2s;
-}
-
-.whitelist-remove:hover {
-  opacity: 1;
-}
-
 .footer-row {
   display: flex;
   justify-content: space-between;
@@ -436,4 +346,98 @@ h1 {
   color: #667eea;
   font-size: 11px;
   border: 1px solid #e0e0e0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   DARK MODE — автоматический тёмный режим (system preference)
+   ═══════════════════════════════════════════════════════════════ */
+@media (prefers-color-scheme: dark) {
+  body {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  }
+
+  .container {
+    background: #1e1e2e;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  }
+
+  h1 {
+    color: #e0e0e0;
+  }
+
+  .subtitle {
+    color: #999;
+  }
+
+  .toggle-section {
+    background: #2a2a3e;
+  }
+
+  .toggle-label span {
+    color: #ddd;
+  }
+
+  .toggle-switch .slider {
+    background-color: #444;
+  }
+
+  .sensitivity-header {
+    color: #ddd;
+  }
+
+  .range-slider {
+    background: linear-gradient(to right, #667eea 0%, #764ba2 50%, #3a3a4e 50%);
+  }
+
+  .slider-labels span {
+    color: #777;
+  }
+
+  .stat-item {
+    background: linear-gradient(135deg, #2a2a3e 0%, #1e1e2e 100%);
+  }
+
+  .stat-number {
+    color: #8b9cf7;
+  }
+
+  .stat-label {
+    color: #888;
+  }
+
+  .footer {
+    border-top-color: #333;
+  }
+
+  .btn-reset {
+    border-color: #444;
+    color: #999;
+  }
+
+  .btn-reset:hover {
+    border-color: #8b9cf7;
+    color: #8b9cf7;
+  }
+
+  .bank-details {
+    background: #2a2a3e;
+  }
+
+  .bank-info p {
+    color: #bbb;
+  }
+
+  .bank-info strong {
+    color: #ddd;
+  }
+
+  .bank-info code {
+    background: #333;
+    color: #8b9cf7;
+    border-color: #444;
+  }
+
+  .beta-warning {
+    background: linear-gradient(135deg, #e65100 0%, #bf360c 100%);
+  }
 }

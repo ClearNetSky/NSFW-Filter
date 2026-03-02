@@ -82,17 +82,5 @@
   "languageEnglish": {
     "message": "🇬🇧 English",
     "description": "English language option"
-  },
-  "whitelistTitle": {
-    "message": "Trusted Sites",
-    "description": "Whitelist section title"
-  },
-  "whitelistAdd": {
-    "message": "✔ Trust This Site",
-    "description": "Button to whitelist current site"
-  },
-  "whitelistEmpty": {
-    "message": "No trusted sites",
-    "description": "Empty whitelist message"
   }
 }

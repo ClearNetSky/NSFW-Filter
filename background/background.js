@@ -74,8 +74,7 @@ chrome.runtime.onInstalled.addListener(async () => {
     enabled: true,
     sensitivity: 50,
     categories: { porn: true, sexy: true, hentai: true },
-    stats: { blocked: 0, scanned: 0 },
-    whitelist: []
+    stats: { blocked: 0, scanned: 0 }
   };
 
   const existing = await chrome.storage.local.get(Object.keys(defaults));
@@ -128,12 +127,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'FETCH_IMAGE':
       fetchImageAsDataUrl(message.url)
-        .then(sendResponse)
-        .catch(err => sendResponse({ success: false, error: err.message }));
-      return true; // async
-
-    case 'WHITELIST_CURRENT':
-      whitelistDomain(message.domain)
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true; // async
@@ -210,44 +203,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 async function getSettings() {
-  const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories', 'whitelist']);
+  const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories']);
   return {
     enabled: result.enabled !== false,
     sensitivity: result.sensitivity ?? 50,
-    categories: result.categories ?? { porn: true, sexy: true, hentai: true },
-    whitelist: result.whitelist ?? []
+    categories: result.categories ?? { porn: true, sexy: true, hentai: true }
   };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// WHITELIST
-// ═══════════════════════════════════════════════════════════════
-
-async function whitelistDomain(domain) {
-  const result = await chrome.storage.local.get('whitelist');
-  const whitelist = result.whitelist ?? [];
-  const clean = domain.trim().toLowerCase();
-  if (!clean) return { success: false, error: 'Empty domain' };
-  if (!whitelist.includes(clean)) {
-    whitelist.push(clean);
-    await chrome.storage.local.set({ whitelist });
-  }
-  // Уведомляем все вкладки об обновлении
-  await broadcastSettings();
-  return { success: true };
-}
-
-async function broadcastSettings() {
-  const settings = await getSettings();
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    if (tab.id) {
-      chrome.tabs.sendMessage(tab.id, {
-        type: 'SETTINGS_UPDATED',
-        settings
-      }).catch(() => {});
-    }
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════

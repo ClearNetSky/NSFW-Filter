@@ -1,7 +1,7 @@
-// NSFW Filter Content Script — v5.0
+// NSFW Filter Content Script — v7.0
 // Централизованная модель через offscreen document (загружается один раз)
 // 5-классовая система NSFWJS: Drawing, Hentai, Neutral, Porn, Sexy
-// v5.0: whitelist, badge, SVG placeholder, tensor cleanup, safe pattern skip
+// v7.0: opacity-hide pending images, scan ALL, dark mode popup
 
 (async function() {
   'use strict';
@@ -13,26 +13,8 @@
   let settings = {
     enabled: true,
     sensitivity: 50,
-    categories: { porn: true, sexy: true, hentai: true },
-    whitelist: []
+    categories: { porn: true, sexy: true, hentai: true }
   };
-
-  // ═══════════════════════════════════════════════════════════════
-  // WHITELIST — доверенные домены (не сканируются)
-  // ═══════════════════════════════════════════════════════════════
-
-  function isWhitelistedDomain() {
-    const hostname = location.hostname;
-    if (!hostname) return false;
-    return settings.whitelist.some(domain => {
-      // Поддержка wildcard (*.example.com) и точного совпадения
-      if (domain.startsWith('*.')) {
-        const base = domain.slice(2);
-        return hostname === base || hostname.endsWith('.' + base);
-      }
-      return hostname === domain || hostname.endsWith('.' + domain);
-    });
-  }
 
   // ═══════════════════════════════════════════════════════════════
   // ПРОПУСК БЕЗОПАСНЫХ ПАТТЕРНОВ
@@ -67,14 +49,36 @@
   // Параметры производительности
   const CONFIG = {
     MIN_IMAGE_SIZE: 50,          // Минимальный размер изображения (px)
-    MAX_CONCURRENT: 4,           // Параллельных классификаций одновременно
+    MAX_CONCURRENT: 6,           // Параллельных классификаций одновременно
     RESIZE_TARGET: 299,          // Размер для модели (299x299)
     JPEG_QUALITY: 0.7,           // Качество JPEG (ниже = быстрее передача)
     STATS_DEBOUNCE: 2000,        // Частота отправки статистики (мс)
     SCAN_DEBOUNCE: 50,           // Дебаунс сканирования DOM (мс)
-    VISIBILITY_CHECK: true,      // Приоритизация видимых изображений
-    BATCH_SIZE: 6,               // Размер пакета для одновременной обработки
+    BATCH_SIZE: 8,               // Размер пакета для одновременной обработки
   };
+
+  // ═══════════════════════════════════════════════════════════════
+  // CSS INJECTION — скрываем изображения до завершения классификации
+  // ═══════════════════════════════════════════════════════════════
+  // Новые изображения получают opacity:0 (белый фон) до проверки.
+  // Если безопасно → opacity восстанавливается. Если NSFW → placeholder.
+  // Пользователь НИКОГДА не увидит NSFW: картинка скрыта до вердикта.
+
+  function injectScanningCSS() {
+    if (document.getElementById('nsfw-filter-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'nsfw-filter-styles';
+    style.textContent = `
+      .nsfw-pending {
+        opacity: 0 !important;
+        transition: opacity 0.15s ease !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  // Инжектируем CSS как можно раньше
+  injectScanningCSS();
 
   // ═══════════════════════════════════════════════════════════════
   // СОСТОЯНИЕ
@@ -182,45 +186,14 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // СИСТЕМА ОЧЕРЕДЕЙ С ПРИОРИТЕТАМИ + INTERSECTIONOBSERVER
+  // СИСТЕМА ОЧЕРЕДЕЙ — СКАНИРОВАНИЕ ВСЕХ ИЗОБРАЖЕНИЙ
   // ═══════════════════════════════════════════════════════════════
-
-  // Множество видимых элементов (обновляется IntersectionObserver'ом)
-  const visibleElements = new WeakSet();
-
-  // IntersectionObserver для эффективного отслеживания видимости
-  // Значительно быстрее чем getBoundingClientRect при scroll
-  const visibilityObserver = new IntersectionObserver((entries) => {
-    for (const entry of entries) {
-      if (entry.isIntersecting) {
-        visibleElements.add(entry.target);
-        // Если изображение стало видимым и ещё не обработано — приоритизируем
-        if (!processedImages.has(entry.target) && entry.target.dataset.nsfwBlocked !== 'true') {
-          enqueueImage(entry.target);
-        }
-      } else {
-        visibleElements.delete(entry.target);
-      }
-    }
-  }, {
-    rootMargin: '100% 0px 100% 0px' // 1 экран сверху и снизу
-  });
-
-  function isElementVisible(el) {
-    if (!CONFIG.VISIBILITY_CHECK) return true;
-    return visibleElements.has(el);
-  }
+  // Все изображения обрабатываются в порядке появления в DOM.
+  // Предварительное размытие (blur) скрывает контент до классификации.
+  // IntersectionObserver убран — ВСЕ изображения сканируются сразу.
 
   function enqueueImage(img) {
-    // Видимые изображения получают высокий приоритет
-    const priority = isElementVisible(img) ? 0 : 1;
-    imageQueue.push({ img, priority });
-    
-    // Сортируем: видимые сначала
-    if (imageQueue.length > 1) {
-      imageQueue.sort((a, b) => a.priority - b.priority);
-    }
-    
+    imageQueue.push({ img });
     drainQueue();
   }
 
@@ -284,6 +257,7 @@
           blockImage(img, cached.reason, cached.category);
           updateStats(1, 1);
         } else {
+          img.classList.remove('nsfw-pending'); // Безопасно: показываем
           updateStats(0, 1);
         }
         return;
@@ -298,7 +272,8 @@
       }
       
       if (!imageDataUrl) {
-        // Cannot convert image — skip silently
+        // Cannot convert image — показываем и пропускаем
+        img.classList.remove('nsfw-pending');
         return;
       }
       
@@ -314,12 +289,16 @@
           blockImage(img, result.reason, result.category);
           updateStats(1, 1);
         } else {
+          img.classList.remove('nsfw-pending'); // Безопасно: показываем
           updateStats(0, 1);
         }
+      } else {
+        img.classList.remove('nsfw-pending'); // Нет результатов: показываем
       }
     } catch (error) {
       // Не блокируем при ошибке, но убираем из обработанных для повторной попытки
       processedImages.delete(img);
+      img.classList.remove('nsfw-pending'); // Ошибка: показываем
       console.debug('NSFW Filter: Process error', error.message);
     }
   }
@@ -509,6 +488,9 @@
   }
 
   function blockImage(img, reason, category) {
+    // Снимаем pending-скрытие
+    img.classList.remove('nsfw-pending');
+    
     img.dataset.nsfwOriginalSrc = img.src;
     img.dataset.nsfwBlocked = 'true';
     img.dataset.nsfwReason = reason;
@@ -558,8 +540,6 @@
       const response = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
       if (response) {
         settings = response;
-        // Убеждаемся что whitelist присутствует
-        if (!settings.whitelist) settings.whitelist = [];
       }
     } catch (error) {
       console.error('NSFW Filter: Failed to fetch settings', error);
@@ -587,8 +567,8 @@
     const h = img.naturalHeight || img.height;
     if (w < CONFIG.MIN_IMAGE_SIZE && h < CONFIG.MIN_IMAGE_SIZE) return;
 
-    // Регистрируем в IntersectionObserver для отслеживания видимости
-    visibilityObserver.observe(img);
+    // Скрываем изображение до завершения проверки (opacity: 0)
+    img.classList.add('nsfw-pending');
 
     if (img.complete && img.naturalWidth > 0) {
       enqueueImage(img);
@@ -646,7 +626,7 @@
     // Ограничиваем для производительности — только видимые элементы разумного размера
     const containers = document.querySelectorAll('div[class], a[class], span[class]');
     for (const el of containers) {
-      if (!processedBgElements.has(el) && isElementVisible(el)) {
+      if (!processedBgElements.has(el)) {
         const rect = el.getBoundingClientRect();
         if (rect.width >= CONFIG.MIN_IMAGE_SIZE && rect.height >= CONFIG.MIN_IMAGE_SIZE) {
           const computed = getComputedStyle(el);
@@ -854,9 +834,16 @@
       
       if (mutation.type === 'attributes' && mutation.target.nodeName === 'IMG') {
         const img = mutation.target;
-        if (img.dataset.nsfwBlocked !== 'true' && mutation.attributeName === 'src') {
+        const attr = mutation.attributeName;
+        if (img.dataset.nsfwBlocked !== 'true' && attr === 'src') {
           processedImages.delete(img);
           mutationBatch.push(img);
+        }
+        // Lazy-load: data-src, data-lazy-src, data-original, srcset → скоро сменится src
+        if (['data-src', 'data-lazy-src', 'data-original', 'srcset'].includes(attr)) {
+          if (!processedImages.has(img)) {
+            mutationBatch.push(img);
+          }
         }
       }
       
@@ -893,14 +880,9 @@
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'SETTINGS_UPDATED') {
       const wasEnabled = settings.enabled;
-      const oldWhitelist = settings.whitelist || [];
       settings = message.settings;
       
-      // Проверяем изменение whitelist
-      const newWhitelist = settings.whitelist || [];
-      const whitelistChanged = JSON.stringify(oldWhitelist) !== JSON.stringify(newWhitelist);
-      
-      if (!settings.enabled || isWhitelistedDomain()) {
+      if (!settings.enabled) {
         // Разблокируем все изображения
         document.querySelectorAll('img[data-nsfw-blocked="true"]').forEach(img => {
           if (img.dataset.nsfwOriginalSrc) {
@@ -955,17 +937,11 @@
     await fetchSettings();
     if (!settings.enabled) return;
     
-    // Пропускаем whitelisted домены
-    if (isWhitelistedDomain()) {
-      console.log('NSFW Filter: Domain whitelisted, skipping');
-      return;
-    }
-    
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['src', 'style', 'poster']
+      attributeFilter: ['src', 'style', 'poster', 'data-src', 'data-lazy-src', 'data-original', 'srcset']
     });
     
     // Приоритизируем видимые изображения при первом скане
@@ -987,7 +963,7 @@
       }, 300);
     }, { passive: true });
     
-    console.log('NSFW Filter v5.0: Initialized (centralized model)');
+    console.log('NSFW Filter v7.0: Initialized (opacity-hide, scan all images)');
   }
 
   init();
