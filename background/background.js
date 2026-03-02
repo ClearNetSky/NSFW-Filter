@@ -74,7 +74,8 @@ chrome.runtime.onInstalled.addListener(async () => {
     enabled: true,
     sensitivity: 50,
     categories: { porn: true, sexy: true, hentai: true },
-    stats: { blocked: 0, scanned: 0 }
+    stats: { blocked: 0, scanned: 0 },
+    whitelist: []
   };
 
   const existing = await chrome.storage.local.get(Object.keys(defaults));
@@ -117,7 +118,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true; // async
 
     case 'UPDATE_STATS':
-      updateStats(message.blocked, message.scanned);
+      updateStats(message.blocked, message.scanned, sender.tab?.id);
       sendResponse({ success: true });
       return false;
 
@@ -127,6 +128,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'FETCH_IMAGE':
       fetchImageAsDataUrl(message.url)
+        .then(sendResponse)
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true; // async
+
+    case 'WHITELIST_CURRENT':
+      whitelistDomain(message.domain)
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true; // async
@@ -158,24 +165,89 @@ async function handleClassify(message) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// СТАТИСТИКА И НАСТРОЙКИ
+// СТАТИСТИКА, НАСТРОЙКИ И BADGE
 // ═══════════════════════════════════════════════════════════════
 
-async function updateStats(blocked, scanned) {
+// Счётчик блокировок по вкладкам (для badge)
+const tabBlockCounts = new Map();
+
+async function updateStats(blocked, scanned, tabId) {
   const result = await chrome.storage.local.get('stats');
   const stats = result.stats ?? { blocked: 0, scanned: 0 };
   stats.blocked += blocked;
   stats.scanned += scanned;
   await chrome.storage.local.set({ stats });
+  
+  // Обновляем badge на иконке расширения
+  if (tabId && blocked > 0) {
+    const current = tabBlockCounts.get(tabId) || 0;
+    const newCount = current + blocked;
+    tabBlockCounts.set(tabId, newCount);
+    updateBadge(tabId, newCount);
+  }
 }
 
+function updateBadge(tabId, count) {
+  if (count > 0) {
+    const text = count > 99 ? '99+' : count.toString();
+    chrome.action.setBadgeText({ text, tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#e53935', tabId });
+  } else {
+    chrome.action.setBadgeText({ text: '', tabId });
+  }
+}
+
+// Очищаем badge при навигации
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading') {
+    tabBlockCounts.delete(tabId);
+    chrome.action.setBadgeText({ text: '', tabId });
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabBlockCounts.delete(tabId);
+});
+
 async function getSettings() {
-  const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories']);
+  const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories', 'whitelist']);
   return {
     enabled: result.enabled !== false,
     sensitivity: result.sensitivity ?? 50,
-    categories: result.categories ?? { porn: true, sexy: true, hentai: true }
+    categories: result.categories ?? { porn: true, sexy: true, hentai: true },
+    whitelist: result.whitelist ?? []
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WHITELIST
+// ═══════════════════════════════════════════════════════════════
+
+async function whitelistDomain(domain) {
+  const result = await chrome.storage.local.get('whitelist');
+  const whitelist = result.whitelist ?? [];
+  const clean = domain.trim().toLowerCase();
+  if (!clean) return { success: false, error: 'Empty domain' };
+  if (!whitelist.includes(clean)) {
+    whitelist.push(clean);
+    await chrome.storage.local.set({ whitelist });
+  }
+  // Уведомляем все вкладки об обновлении
+  await broadcastSettings();
+  return { success: true };
+}
+
+async function broadcastSettings() {
+  const settings = await getSettings();
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (tab.id) {
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'SETTINGS_UPDATED',
+        settings
+      }).catch(() => {});
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════

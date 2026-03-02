@@ -82,5 +82,17 @@
   "languageEnglish": {
     "message": "🇬🇧 English",
     "description": "Опция английского языка"
+  },
+  "whitelistTitle": {
+    "message": "Доверенные сайты",
+    "description": "Заголовок секции whitelist"
+  },
+  "whitelistAdd": {
+    "message": "✔ Доверять этому сайту",
+    "description": "Кнопка добавления текущего сайта в whitelist"
+  },
+  "whitelistEmpty": {
+    "message": "Нет доверенных сайтов",
+    "description": "Сообщение при пустом whitelist"
   }
 }

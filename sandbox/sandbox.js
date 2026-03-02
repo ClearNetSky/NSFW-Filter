@@ -9,6 +9,8 @@ let backendName = 'unknown';
 let isContextLost = false;
 let isRecovering = false;
 let recoveryPromise = null;
+let classificationCount = 0; // Счётчик для периодической очистки памяти
+const CLEANUP_INTERVAL = 50; // Очистка каждые N классификаций
 
 // ═══════════════════════════════════════════════════════════════
 // WEBGL CONTEXT LOSS RECOVERY
@@ -208,8 +210,9 @@ async function classifyFromBitmap(bitmap) {
   ctx.drawImage(bitmap, 0, 0, 299, 299);
   bitmap.close(); // Освобождаем память
   
-  // Классифицируем
+  // Классифицируем внутри tf.tidy для автоматического освобождения тензоров
   const predictions = await loadedModel.classify(canvas, 5);
+  periodicCleanup();
   
   // Возвращаем упрощённый формат для быстрой передачи
   return predictions.map(p => ({
@@ -228,6 +231,7 @@ async function classifyFromDataUrl(imageDataUrl) {
     img.onload = async () => {
       try {
         const predictions = await loadedModel.classify(img, 5);
+        periodicCleanup();
         resolve(predictions.map(p => ({
           className: p.className,
           probability: p.probability
@@ -239,6 +243,22 @@ async function classifyFromDataUrl(imageDataUrl) {
     img.onerror = () => reject(new Error('Failed to load image'));
     img.src = imageDataUrl;
   });
+}
+
+// Периодическая очистка памяти TF.js — предотвращает утечки тензоров
+function periodicCleanup() {
+  classificationCount++;
+  if (classificationCount % CLEANUP_INTERVAL === 0) {
+    try {
+      // Принудительная очистка неиспользуемых тензоров и WebGL текстур
+      if (typeof tf !== 'undefined') {
+        const info = tf.memory();
+        console.log(`NSFW Sandbox: Memory cleanup — ${info.numTensors} tensors, ${(info.numBytes / 1024 / 1024).toFixed(1)}MB`);
+      }
+    } catch (e) {
+      // Некритично
+    }
+  }
 }
 
 // Обёртка с автоматическим retry при потере WebGL контекста

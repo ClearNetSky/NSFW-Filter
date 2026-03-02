@@ -8,6 +8,9 @@ const resetStats = document.getElementById('resetStats');
 const showBankDetails = document.getElementById('showBankDetails');
 const bankDetails = document.getElementById('bankDetails');
 const languageToggle = document.getElementById('languageToggle');
+const whitelistCurrent = document.getElementById('whitelistCurrent');
+const whitelistStatus = document.getElementById('whitelistStatus');
+const whitelistList = document.getElementById('whitelistList');
 
 // Получение текущего языка
 async function getCurrentLanguage() {
@@ -87,6 +90,7 @@ function formatNumber(num) {
 
 // Сохранение настроек
 async function saveSettings() {
+  const result = await chrome.storage.local.get('whitelist');
   const settings = {
     enabled: enableFilter.checked,
     sensitivity: parseInt(sensitivity.value),
@@ -95,18 +99,21 @@ async function saveSettings() {
       porn: true,
       sexy: true,
       hentai: true
-    }
+    },
+    whitelist: result.whitelist ?? []
   };
 
   await chrome.storage.local.set(settings);
 
-  // Уведомление content scripts об изменении настроек
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tabs[0]) {
-    chrome.tabs.sendMessage(tabs[0].id, {
-      type: 'SETTINGS_UPDATED',
-      settings
-    }).catch(() => {});
+  // Уведомление ВСЕХ content scripts об изменении настроек
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (tab.id) {
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'SETTINGS_UPDATED',
+        settings
+      }).catch(() => {});
+    }
   }
 }
 
@@ -156,8 +163,93 @@ chrome.storage.onChanged.addListener((changes) => {
     blockedCount.textContent = formatNumber(stats.blocked);
     scannedCount.textContent = formatNumber(stats.scanned);
   }
+  if (changes.whitelist) {
+    renderWhitelist(changes.whitelist.newValue || []);
+  }
 });
+
+// ═══════════════════════════════════════════════════════════════
+// WHITELIST
+// ═══════════════════════════════════════════════════════════════
+
+// Whitelist текущего сайта
+whitelistCurrent.addEventListener('click', async () => {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs[0]?.url) return;
+  
+  try {
+    const url = new URL(tabs[0].url);
+    const domain = url.hostname;
+    if (!domain) return;
+    
+    const response = await chrome.runtime.sendMessage({
+      type: 'WHITELIST_CURRENT',
+      domain
+    });
+    
+    if (response?.success) {
+      whitelistStatus.textContent = `✓ ${domain}`;
+      whitelistStatus.classList.remove('hidden');
+      setTimeout(() => whitelistStatus.classList.add('hidden'), 3000);
+      loadWhitelist();
+    }
+  } catch (e) {
+    console.error('Whitelist error:', e);
+  }
+});
+
+async function loadWhitelist() {
+  const result = await chrome.storage.local.get('whitelist');
+  renderWhitelist(result.whitelist || []);
+}
+
+async function renderWhitelist(list) {
+  const currentLang = await getCurrentLanguage();
+  
+  whitelistList.innerHTML = '';
+  if (list.length === 0) return;
+  
+  for (const domain of list) {
+    const item = document.createElement('div');
+    item.className = 'whitelist-item';
+    
+    const domainSpan = document.createElement('span');
+    domainSpan.className = 'domain';
+    domainSpan.textContent = domain;
+    
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'whitelist-remove';
+    removeBtn.textContent = '×';
+    removeBtn.title = currentLang === 'ru' ? 'Удалить' : 'Remove';
+    removeBtn.addEventListener('click', async () => {
+      const result = await chrome.storage.local.get('whitelist');
+      const wl = (result.whitelist || []).filter(d => d !== domain);
+      await chrome.storage.local.set({ whitelist: wl });
+      
+      // Broadcast updated settings
+      const settings = {
+        enabled: enableFilter.checked,
+        sensitivity: parseInt(sensitivity.value),
+        categories: { porn: true, sexy: true, hentai: true },
+        whitelist: wl
+      };
+      const tabs = await chrome.tabs.query({});
+      for (const tab of tabs) {
+        if (tab.id) {
+          chrome.tabs.sendMessage(tab.id, { type: 'SETTINGS_UPDATED', settings }).catch(() => {});
+        }
+      }
+      
+      loadWhitelist();
+    });
+    
+    item.appendChild(domainSpan);
+    item.appendChild(removeBtn);
+    whitelistList.appendChild(item);
+  }
+}
 
 // Инициализация
 loadI18nMessages();
 loadSettings();
+loadWhitelist();

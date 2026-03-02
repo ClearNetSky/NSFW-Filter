@@ -1,7 +1,7 @@
-// NSFW Filter Content Script — v4.0
+// NSFW Filter Content Script — v5.0
 // Централизованная модель через offscreen document (загружается один раз)
 // 5-классовая система NSFWJS: Drawing, Hentai, Neutral, Porn, Sexy
-// v4.0: URL-кэш, CSS background-image, video poster, IntersectionObserver, retry
+// v5.0: whitelist, badge, SVG placeholder, tensor cleanup, safe pattern skip
 
 (async function() {
   'use strict';
@@ -13,8 +13,56 @@
   let settings = {
     enabled: true,
     sensitivity: 50,
-    categories: { porn: true, sexy: true, hentai: true }
+    categories: { porn: true, sexy: true, hentai: true },
+    whitelist: []
   };
+
+  // ═══════════════════════════════════════════════════════════════
+  // WHITELIST — доверенные домены (не сканируются)
+  // ═══════════════════════════════════════════════════════════════
+
+  function isWhitelistedDomain() {
+    const hostname = location.hostname;
+    if (!hostname) return false;
+    return settings.whitelist.some(domain => {
+      // Поддержка wildcard (*.example.com) и точного совпадения
+      if (domain.startsWith('*.')) {
+        const base = domain.slice(2);
+        return hostname === base || hostname.endsWith('.' + base);
+      }
+      return hostname === domain || hostname.endsWith('.' + domain);
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // ПРОПУСК БЕЗОПАСНЫХ ПАТТЕРНОВ
+  // ═══════════════════════════════════════════════════════════════
+  // SVG, data:image/svg, 1x1 трекинг-пиксели, иконки расширений
+
+  const SAFE_URL_PATTERNS = [
+    /\.svg(\?|$)/i,                         // SVG файлы
+    /^data:image\/svg/i,                     // SVG data URL
+    /^chrome-extension:\/\//i,               // Ресурсы расширений
+    /^moz-extension:\/\//i,                  // Firefox расширения
+    /favicon/i,                              // Фавиконы
+    /\/icons?\//i,                           // Папки иконок
+    /\.(gif)(\?|$)/i,                        // GIF (обычно анимации/иконки)
+    /^data:image\/gif;base64,.{0,200}$/i,    // Крошечные GIF (трекеры)
+    /\/sprite[s]?[\-_\.]/i,                  // CSS спрайты
+    /badge|logo|avatar/i,                    // Значки, логотипы
+  ];
+
+  function isSafeUrl(url) {
+    if (!url) return false;
+    return SAFE_URL_PATTERNS.some(pattern => pattern.test(url));
+  }
+
+  // Проверка: трекинг-пиксель (1x1, 2x2 и т.д.)
+  function isTrackingPixel(img) {
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    return (w <= 3 && h <= 3);
+  }
 
   // Параметры производительности
   const CONFIG = {
@@ -444,39 +492,17 @@
       return placeholderCache.get(key);
     }
     
-    const canvas = document.createElement('canvas');
-    canvas.width = cw;
-    canvas.height = ch;
-    const ctx = canvas.getContext('2d');
+    // SVG placeholder — в 50-100x легче чем PNG canvas
+    // Адаптивный: щит + текст "NSFW" масштабируются под любой размер
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cw}" height="${ch}" viewBox="0 0 ${cw} ${ch}">
+      <rect width="100%" height="100%" fill="#f0f0f0"/>
+      <g transform="translate(${cw/2},${ch/2})" opacity="0.3">
+        <path d="M0 ${-ch*0.12} L${cw*0.1} ${-ch*0.06} L${cw*0.1} ${ch*0.06} Q0 ${ch*0.15} 0 ${ch*0.15} Q0 ${ch*0.15} ${-cw*0.1} ${ch*0.06} L${-cw*0.1} ${-ch*0.06} Z" fill="#999"/>
+        <text y="${ch*0.2}" text-anchor="middle" font-family="sans-serif" font-size="${Math.max(10, Math.min(cw,ch)*0.07)}" fill="#999" font-weight="600">NSFW</text>
+      </g>
+    </svg>`;
     
-    // Белый фон
-    ctx.fillStyle = '#f5f5f5';
-    ctx.fillRect(0, 0, cw, ch);
-    
-    // Иконка щита
-    ctx.fillStyle = '#ddd';
-    const cx = cw / 2;
-    const cy = ch / 2;
-    const sz = Math.min(cw, ch) * 0.25;
-    
-    ctx.beginPath();
-    ctx.moveTo(cx, cy - sz / 2);
-    ctx.lineTo(cx + sz / 2, cy - sz / 4);
-    ctx.lineTo(cx + sz / 2, cy + sz / 4);
-    ctx.quadraticCurveTo(cx, cy + sz / 2, cx, cy + sz / 2);
-    ctx.quadraticCurveTo(cx, cy + sz / 2, cx - sz / 2, cy + sz / 4);
-    ctx.lineTo(cx - sz / 2, cy - sz / 4);
-    ctx.closePath();
-    ctx.fill();
-    
-    // Текст категории
-    const fontSize = Math.max(10, Math.min(cw, ch) * 0.06);
-    ctx.font = `${fontSize}px sans-serif`;
-    ctx.fillStyle = '#bbb';
-    ctx.textAlign = 'center';
-    ctx.fillText('NSFW', cx, cy + sz / 2 + fontSize + 4);
-    
-    const dataUrl = canvas.toDataURL('image/png');
+    const dataUrl = 'data:image/svg+xml,' + encodeURIComponent(svg);
     placeholderCache.set(key, dataUrl);
     
     return dataUrl;
@@ -530,7 +556,11 @@
   async function fetchSettings() {
     try {
       const response = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
-      if (response) settings = response;
+      if (response) {
+        settings = response;
+        // Убеждаемся что whitelist присутствует
+        if (!settings.whitelist) settings.whitelist = [];
+      }
     } catch (error) {
       console.error('NSFW Filter: Failed to fetch settings', error);
     }
@@ -540,6 +570,18 @@
     if (!settings.enabled) return;
     if (processedImages.has(img)) return;
     if (img.dataset.nsfwBlocked === 'true') return;
+    
+    // Пропускаем безопасные URL (SVG, favicon, иконки и т.д.)
+    if (isSafeUrl(img.src)) {
+      processedImages.add(img);
+      return;
+    }
+    
+    // Пропускаем трекинг-пиксели
+    if (isTrackingPixel(img)) {
+      processedImages.add(img);
+      return;
+    }
     
     const w = img.naturalWidth || img.width;
     const h = img.naturalHeight || img.height;
@@ -850,9 +892,15 @@
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'SETTINGS_UPDATED') {
+      const wasEnabled = settings.enabled;
+      const oldWhitelist = settings.whitelist || [];
       settings = message.settings;
       
-      if (!settings.enabled) {
+      // Проверяем изменение whitelist
+      const newWhitelist = settings.whitelist || [];
+      const whitelistChanged = JSON.stringify(oldWhitelist) !== JSON.stringify(newWhitelist);
+      
+      if (!settings.enabled || isWhitelistedDomain()) {
         // Разблокируем все изображения
         document.querySelectorAll('img[data-nsfw-blocked="true"]').forEach(img => {
           if (img.dataset.nsfwOriginalSrc) {
@@ -907,6 +955,12 @@
     await fetchSettings();
     if (!settings.enabled) return;
     
+    // Пропускаем whitelisted домены
+    if (isWhitelistedDomain()) {
+      console.log('NSFW Filter: Domain whitelisted, skipping');
+      return;
+    }
+    
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
@@ -933,7 +987,7 @@
       }, 300);
     }, { passive: true });
     
-    console.log('NSFW Filter v4.0: Initialized (centralized model)');
+    console.log('NSFW Filter v5.0: Initialized (centralized model)');
   }
 
   init();
