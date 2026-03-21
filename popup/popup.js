@@ -103,6 +103,12 @@ async function saveSettings() {
 
   await chrome.storage.local.set(settings);
 
+  // Уведомление background → offscreen (модель + чувствительность)
+  chrome.runtime.sendMessage({
+    type: 'SETTINGS_UPDATED',
+    settings
+  }).catch(() => {});
+
   // Уведомление ВСЕХ content scripts об изменении настроек
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {

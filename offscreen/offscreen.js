@@ -475,6 +475,24 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     activeTabId = message.tabId;
   }
 
+  if (message.type === 'OFFSCREEN_SETTINGS_UPDATED') {
+    const oldModel = settings.trainedModel;
+    if (message.settings) Object.assign(settings, message.settings);
+    // If model changed, reload it
+    if (settings.trainedModel !== oldModel) {
+      console.log(`NSFW Offscreen: Model changed ${oldModel} → ${settings.trainedModel}, reloading...`);
+      model = null;
+      cache.clear();
+      requestMap.clear();
+      loadingQueue.clear();
+      predictionQueue.clear();
+      loadModel().then(flushBuffered);
+    } else {
+      // Sensitivity or categories changed — clear cache so new threshold applies
+      cache.clear();
+    }
+  }
+
   if (message.type === 'OFFSCREEN_CLEAR_CACHE') {
     if (message.settings) Object.assign(settings, message.settings);
     cache.clear();

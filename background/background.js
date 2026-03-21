@@ -148,8 +148,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  // Settings updated notification (from popup) — ignore here
-  if (message.type === 'SETTINGS_UPDATED') return;
+  // Settings updated from popup — forward to offscreen
+  if (message.type === 'SETTINGS_UPDATED') {
+    chrome.runtime.sendMessage({
+      type: 'OFFSCREEN_SETTINGS_UPDATED',
+      settings: message.settings
+    }).catch(() => {});
+    return;
+  }
   if (message.type === 'SIGN_CONNECT') return;
 
   // Prediction request from content script — forward to offscreen

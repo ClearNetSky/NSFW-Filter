@@ -72,11 +72,17 @@
     const style = document.createElement('style');
     style.id = 'nsfw-filter-styles';
     style.textContent = `
+      img:not([data-nsfw-filter-status]) {
+        opacity: 0 !important;
+      }
       img[data-nsfw-filter-status="processing"] {
-        visibility: hidden !important;
+        opacity: 0 !important;
       }
       img[data-nsfw-filter-status="nsfw"] {
         visibility: hidden !important;
+      }
+      img[data-nsfw-filter-status="sfw"] {
+        opacity: 1 !important;
       }
     `;
     (document.head || document.documentElement).appendChild(style);
@@ -150,19 +156,29 @@
   }
 
   function analyzeImage(image, isSrcChange) {
-    if (!settings.enabled || !contextValid) return;
+    if (!settings.enabled || !contextValid) {
+      // Filter disabled — mark as safe so images are visible
+      if (!image.dataset.nsfwFilterStatus) image.dataset.nsfwFilterStatus = 'sfw';
+      return;
+    }
 
     const imageIsNotAnalyzed = isSrcChange || image.dataset.nsfwFilterStatus === undefined;
     if (!imageIsNotAnalyzed) return;
 
     // Get the actual image URL (handles srcset, lazy-load, etc.)
     const url = getImageUrl(image);
-    if (!url || isSafeUrl(url)) return;
+    if (!url || isSafeUrl(url)) {
+      image.dataset.nsfwFilterStatus = 'sfw';
+      return;
+    }
 
     // Check size — but allow 0x0 (not yet rendered)
     const w = image.naturalWidth || image.width || image.offsetWidth;
     const h = image.naturalHeight || image.height || image.offsetHeight;
-    if (w > 0 && w < MIN_IMAGE_SIZE && h > 0 && h < MIN_IMAGE_SIZE) return;
+    if (w > 0 && w < MIN_IMAGE_SIZE && h > 0 && h < MIN_IMAGE_SIZE) {
+      image.dataset.nsfwFilterStatus = 'sfw';
+      return;
+    }
 
     // Mark as processing — CSS rule hides it
     image.dataset.nsfwFilterStatus = 'processing';
@@ -193,6 +209,7 @@
     const currentUrl = getImageUrl(image);
     if (currentUrl === url || !currentUrl) {
       image.dataset.nsfwFilterStatus = 'sfw';
+      image.style.opacity = '';
       image.style.visibility = '';
       if (image.parentNode?.nodeName === 'BODY') image.hidden = false;
     }
@@ -289,14 +306,18 @@
       settings = message.settings;
 
       if (!settings.enabled) {
-        // Unblock all images
-        document.querySelectorAll('img[data-nsfw-filter-status]').forEach(img => {
+        // Unblock all images — mark as sfw so CSS shows them
+        document.querySelectorAll('img').forEach(img => {
+          img.dataset.nsfwFilterStatus = 'sfw';
           img.style.visibility = '';
+          img.style.opacity = '';
           if (img.parentNode?.nodeName === 'BODY') img.hidden = false;
-          delete img.dataset.nsfwFilterStatus;
         });
       } else if (!wasEnabled) {
-        // Re-enable: scan all images
+        // Re-enable: reset all statuses and re-scan
+        document.querySelectorAll('img[data-nsfw-filter-status]').forEach(img => {
+          delete img.dataset.nsfwFilterStatus;
+        });
         findAndCheckAllImages(document.documentElement);
       }
     }

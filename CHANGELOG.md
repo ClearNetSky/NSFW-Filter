@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.1.0 — Settings Sync & Flash Fix
+
+### Fixes
+- **Settings sync to offscreen** — sensitivity slider and model selection now properly reach the offscreen document via `OFFSCREEN_SETTINGS_UPDATED` message
+- **Model hot-reload** — switching between MobileNet v2 and InceptionV3 now reloads the model without restarting the extension
+- **Cache invalidation on settings change** — LRU cache clears when sensitivity changes so new threshold applies immediately
+- **No NSFW flash on page load** — all images hidden with `opacity: 0` by default until classified; safe images (SVG, GIF, icons, < 32px) are revealed instantly
+- **Popup → Background messaging** — popup now sends `SETTINGS_UPDATED` via `chrome.runtime.sendMessage()` in addition to `chrome.tabs.sendMessage()`, ensuring background and offscreen receive settings changes
+
+### Improvements
+- Images that are skipped (safe URL, too small) now immediately get `data-nsfw-filter-status="sfw"` instead of being left unmarked
+- Filter disable/enable properly resets all image statuses for clean re-scan
+
+---
+
 ## v2.0.0 — Major Architecture Overhaul
 
 ### Architecture
