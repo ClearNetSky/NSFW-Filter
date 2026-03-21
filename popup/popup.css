@@ -215,6 +215,35 @@ h1 {
   color: #999;
 }
 
+/* Model Selection */
+.model-section {
+  margin-bottom: 12px;
+}
+
+.model-header {
+  font-weight: 500;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.model-select {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 12px;
+  color: #333;
+  background: #f8f9fa;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.model-select:focus {
+  border-color: #667eea;
+}
+
 /* Stats */
 .stats-section {
   display: flex;
@@ -348,6 +377,13 @@ h1 {
   border: 1px solid #e0e0e0;
 }
 
+.version {
+  text-align: center;
+  font-size: 10px;
+  color: #aaa;
+  margin-top: 8px;
+}
+
 /* ═══════════════════════════════════════════════════════════════
    DARK MODE — автоматический тёмный режим (system preference)
    ═══════════════════════════════════════════════════════════════ */
@@ -439,5 +475,23 @@ h1 {
 
   .beta-warning {
     background: linear-gradient(135deg, #e65100 0%, #bf360c 100%);
+  }
+
+  .model-header {
+    color: #ddd;
+  }
+
+  .model-select {
+    background: #2a2a3e;
+    color: #ddd;
+    border-color: #444;
+  }
+
+  .model-select:focus {
+    border-color: #8b9cf7;
+  }
+
+  .version {
+    color: #555;
   }
 }

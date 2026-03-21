@@ -1,36 +1,17 @@
-// Background Service Worker для NSFW Filter
-// Управляет offscreen document (модель загружается один раз)
-// Маршрутизирует запросы классификации от content scripts
+// Background Service Worker — NSFW Filter v8.0
+// Routes prediction requests: content.js → offscreen.js
+// Manages offscreen document lifecycle, stats, and tab tracking
+// Architecture matches reference extension (3-layer, no sandbox)
 
 const OFFSCREEN_PATH = 'offscreen/offscreen.html';
+const STORAGE_KEY = 'nsfw-filter-settings';
 
 // ═══════════════════════════════════════════════════════════════
-// SERVICE WORKER KEEPALIVE
+// PENDING REQUESTS — requestId → sendResponse callback
 // ═══════════════════════════════════════════════════════════════
-// Chrome убивает idle SW через 30 секунд.
-// Поддерживаем SW активным пока идут классификации.
 
-let activeClassifications = 0;
-let keepAliveInterval = null;
-
-function startKeepAlive() {
-  if (keepAliveInterval) return;
-  keepAliveInterval = setInterval(() => {
-    // Простой self-ping для сброса idle timeout Chrome
-    if (activeClassifications > 0) {
-      chrome.runtime.getPlatformInfo(() => {});
-    } else {
-      stopKeepAlive();
-    }
-  }, 25000); // Каждые 25 секунд (timeout = 30s)
-}
-
-function stopKeepAlive() {
-  if (keepAliveInterval) {
-    clearInterval(keepAliveInterval);
-    keepAliveInterval = null;
-  }
-}
+const pendingRequests = new Map();
+let requestCounter = 0;
 
 // ═══════════════════════════════════════════════════════════════
 // OFFSCREEN DOCUMENT MANAGEMENT
@@ -39,7 +20,6 @@ function stopKeepAlive() {
 let creatingOffscreen = null;
 
 async function ensureOffscreenDocument() {
-  // Проверяем, существует ли уже offscreen document
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ['OFFSCREEN_DOCUMENT'],
     documentUrls: [chrome.runtime.getURL(OFFSCREEN_PATH)]
@@ -47,7 +27,6 @@ async function ensureOffscreenDocument() {
 
   if (contexts.length > 0) return;
 
-  // Предотвращаем параллельное создание
   if (creatingOffscreen) {
     await creatingOffscreen;
     return;
@@ -55,18 +34,46 @@ async function ensureOffscreenDocument() {
 
   creatingOffscreen = chrome.offscreen.createDocument({
     url: OFFSCREEN_PATH,
-    reasons: ['IFRAME_SCRIPTING'],
-    justification: 'NSFW image classification using TensorFlow.js in sandboxed iframe'
+    reasons: ['DOM_SCRAPING'],
+    justification: 'NSFW image classification using TensorFlow.js with WebGPU'
   });
 
   await creatingOffscreen;
   creatingOffscreen = null;
 
-  console.log('NSFW Filter: Offscreen document created (model loads once)');
+  // Send initial settings to offscreen
+  const settings = await readSettings();
+  const stats = await readStats();
+  chrome.runtime.sendMessage({
+    type: 'OFFSCREEN_INIT',
+    settings,
+    totalBlocked: stats.blocked || 0
+  }).catch(() => {});
+
+  console.log('NSFW Filter: Offscreen document created (WebGPU, no sandbox)');
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ИНИЦИАЛИЗАЦИЯ
+// SETTINGS & STATS
+// ═══════════════════════════════════════════════════════════════
+
+async function readSettings() {
+  const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories', 'trainedModel']);
+  return {
+    enabled: result.enabled !== false,
+    sensitivity: result.sensitivity ?? 50,
+    categories: result.categories ?? { porn: true, sexy: true, hentai: true },
+    trainedModel: result.trainedModel ?? 'MobileNet_v2'
+  };
+}
+
+async function readStats() {
+  const result = await chrome.storage.local.get('stats');
+  return result.stats ?? { blocked: 0, scanned: 0 };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INITIALIZATION
 // ═══════════════════════════════════════════════════════════════
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -74,6 +81,7 @@ chrome.runtime.onInstalled.addListener(async () => {
     enabled: true,
     sensitivity: 50,
     categories: { porn: true, sexy: true, hentai: true },
+    trainedModel: 'MobileNet_v2',
     stats: { blocked: 0, scanned: 0 }
   };
 
@@ -91,77 +99,93 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
 
   console.log('NSFW Filter: Installed');
-
-  // Создаём offscreen document и начинаем загрузку модели
   await ensureOffscreenDocument();
 });
 
-// Создаём offscreen при запуске браузера
 chrome.runtime.onStartup.addListener(async () => {
   await ensureOffscreenDocument();
 });
 
+// Start offscreen immediately on SW startup
+ensureOffscreenDocument().catch(console.error);
+
 // ═══════════════════════════════════════════════════════════════
-// ОБРАБОТКА СООБЩЕНИЙ
+// MESSAGE HANDLING
 // ═══════════════════════════════════════════════════════════════
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Пропускаем сообщения для offscreen document
-  if (message.target === 'offscreen') return;
+  // Stats update from offscreen (it can't access chrome.storage)
+  if (message.type === 'OFFSCREEN_TOTAL_BLOCKED') {
+    chrome.storage.local.get('stats').then(result => {
+      const stats = result.stats ?? { blocked: 0, scanned: 0 };
+      stats.blocked = message.totalBlocked;
+      chrome.storage.local.set({ stats });
+    });
+    return;
+  }
 
-  switch (message.type) {
-    case 'CLASSIFY_IMAGE':
-      handleClassify(message)
-        .then(sendResponse)
-        .catch(err => sendResponse({ success: false, error: err.message }));
-      return true; // async
+  // Prediction result from offscreen → forward to content script
+  if (message.type === 'PREDICTION_RESULT') {
+    const { requestId, result, url, error } = message;
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      pendingRequests.delete(requestId);
+      pending({ result, url, message: error || '' });
+    }
+    return;
+  }
 
-    case 'UPDATE_STATS':
-      updateStats(message.blocked, message.scanned, sender.tab?.id);
-      sendResponse({ success: true });
-      return false;
+  // Settings request from content script
+  if (message.type === 'GET_SETTINGS') {
+    readSettings().then(sendResponse);
+    return true;
+  }
 
-    case 'GET_SETTINGS':
-      getSettings().then(sendResponse);
-      return true; // async
+  // Stats update from content script
+  if (message.type === 'UPDATE_STATS') {
+    updateStats(message.blocked, message.scanned, sender.tab?.id);
+    sendResponse({ success: true });
+    return false;
+  }
 
-    case 'FETCH_IMAGE':
-      fetchImageAsDataUrl(message.url)
-        .then(sendResponse)
-        .catch(err => sendResponse({ success: false, error: err.message }));
-      return true; // async
+  // Settings updated notification (from popup) — ignore here
+  if (message.type === 'SETTINGS_UPDATED') return;
+  if (message.type === 'SIGN_CONNECT') return;
+
+  // Prediction request from content script — forward to offscreen
+  // Content script sends: { url: "https://..." }
+  if (message.url && typeof message.url === 'string') {
+    const requestId = `${Date.now()}-${++requestCounter}`;
+    const tabIdUrl = {
+      tabId: sender.tab?.id ?? 999999,
+      tabUrl: sender.tab?.url ?? ''
+    };
+
+    pendingRequests.set(requestId, sendResponse);
+
+    ensureOffscreenDocument()
+      .then(() => chrome.runtime.sendMessage({
+        type: 'OFFSCREEN_PREDICT',
+        url: message.url,
+        requestId,
+        tabIdUrl
+      }))
+      .catch(err => {
+        const pending = pendingRequests.get(requestId);
+        if (pending) {
+          pendingRequests.delete(requestId);
+          pending({ result: false, url: message.url, message: err.message });
+        }
+      });
+
+    return true; // Keep channel open for async response
   }
 });
 
-// Маршрутизация классификации в offscreen document
-async function handleClassify(message) {
-  activeClassifications++;
-  startKeepAlive();
-  
-  try {
-    await ensureOffscreenDocument();
-
-    const response = await chrome.runtime.sendMessage({
-      target: 'offscreen',
-      type: 'CLASSIFY_IMAGE',
-      imageDataUrl: message.imageDataUrl
-    });
-
-    return response;
-  } finally {
-    activeClassifications--;
-    if (activeClassifications <= 0) {
-      activeClassifications = 0;
-      stopKeepAlive();
-    }
-  }
-}
-
 // ═══════════════════════════════════════════════════════════════
-// СТАТИСТИКА, НАСТРОЙКИ И BADGE
+// STATISTICS & BADGE
 // ═══════════════════════════════════════════════════════════════
 
-// Счётчик блокировок по вкладкам (для badge)
 const tabBlockCounts = new Map();
 
 async function updateStats(blocked, scanned, tabId) {
@@ -170,8 +194,7 @@ async function updateStats(blocked, scanned, tabId) {
   stats.blocked += blocked;
   stats.scanned += scanned;
   await chrome.storage.local.set({ stats });
-  
-  // Обновляем badge на иконке расширения
+
   if (tabId && blocked > 0) {
     const current = tabBlockCounts.get(tabId) || 0;
     const newCount = current + blocked;
@@ -190,57 +213,51 @@ function updateBadge(tabId, count) {
   }
 }
 
-// Очищаем badge при навигации
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+// ═══════════════════════════════════════════════════════════════
+// TAB LIFECYCLE — forward to offscreen for queue management
+// ═══════════════════════════════════════════════════════════════
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'loading') {
     tabBlockCounts.delete(tabId);
     chrome.action.setBadgeText({ text: '', tabId });
+    chrome.runtime.sendMessage({
+      type: 'OFFSCREEN_TAB_UPDATE',
+      tabIdUrl: { tabId: tab.id, tabUrl: tab.url || '' }
+    }).catch(() => {});
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabBlockCounts.delete(tabId);
+  chrome.runtime.sendMessage({
+    type: 'OFFSCREEN_TAB_REMOVE',
+    tabId
+  }).catch(() => {});
 });
 
-async function getSettings() {
-  const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories']);
-  return {
-    enabled: result.enabled !== false,
-    sensitivity: result.sensitivity ?? 50,
-    categories: result.categories ?? { porn: true, sexy: true, hentai: true }
-  };
-}
+chrome.tabs.onCreated.addListener((tab) => {
+  chrome.runtime.sendMessage({
+    type: 'OFFSCREEN_TAB_ADD',
+    tabIdUrl: { tabId: tab.id, tabUrl: tab.url || '' }
+  }).catch(() => {});
+});
 
-// ═══════════════════════════════════════════════════════════════
-// ПРОКСИ-ЗАГРУЗКА ИЗОБРАЖЕНИЙ (обходит CORS)
-// ═══════════════════════════════════════════════════════════════
-// Service worker не подчиняется CORS-политике страницы,
-// поэтому может загрузить изображение с любого домена.
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  chrome.runtime.sendMessage({
+    type: 'OFFSCREEN_TAB_ACTIVATE',
+    tabId: activeInfo.tabId
+  }).catch(() => {});
+});
 
-async function fetchImageAsDataUrl(url) {
-  try {
-    const response = await fetch(url);
-    if (!response.ok) return { success: false, error: `HTTP ${response.status}` };
-
-    const blob = await response.blob();
-    if (!blob.type.startsWith('image/')) return { success: false, error: 'Not an image' };
-
-    // Конвертируем blob → base64 data URL (chunked для производительности)
-    const buffer = await blob.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    
-    // Chunk-based encoding — в 10-20x быстрее чем посимвольный String.fromCharCode
-    const chunkSize = 8192;
-    const chunks = [];
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      const chunk = bytes.subarray(i, i + chunkSize);
-      chunks.push(String.fromCharCode.apply(null, chunk));
-    }
-    const base64 = btoa(chunks.join(''));
-    const dataUrl = `data:${blob.type};base64,${base64}`;
-
-    return { success: true, dataUrl };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
+// When popup disconnects (settings changed), clear offscreen cache
+chrome.runtime.onConnect.addListener((port) => {
+  port.onDisconnect.addListener(() => {
+    readSettings().then(settings => {
+      chrome.runtime.sendMessage({
+        type: 'OFFSCREEN_CLEAR_CACHE',
+        settings
+      }).catch(() => {});
+    });
+  });
+});

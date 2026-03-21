@@ -5,9 +5,8 @@
   <title>NSFW Filter Offscreen</title>
 </head>
 <body>
-  <!-- Sandbox iframe for TensorFlow.js (needs unsafe-eval CSP) -->
-  <!-- Model loads ONCE here and persists across all tabs -->
-  <iframe id="sandbox" src="../sandbox/sandbox.html" sandbox="allow-scripts" style="display:none"></iframe>
+  <!-- TF.js runs directly here with WebGPU (no sandbox needed) -->
+  <script src="../lib/tfjs-nsfwjs-webgpu.min.js"></script>
   <script src="offscreen.js"></script>
 </body>
 </html>

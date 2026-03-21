@@ -16,14 +16,17 @@ Thumbs.db
 *.tmp
 *.bak
 
-# Build files
-dist/
+# Build tooling (esbuild, node_modules — not part of the extension)
 build/
-
-# Node modules (if using npm for development)
 node_modules/
 
-# Chrome extension specific
+# Reference extension (used for comparison only)
+Check/
+
+# Claude Code
+.claude/
+
+# Chrome extension packaging
 *.crx
 *.pem
 *.zip

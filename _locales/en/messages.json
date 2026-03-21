@@ -82,5 +82,17 @@
   "languageEnglish": {
     "message": "🇬🇧 English",
     "description": "English language option"
+  },
+  "modelSelection": {
+    "message": "AI Model",
+    "description": "Model selection label"
+  },
+  "modelMobileNet": {
+    "message": "MobileNet v2 (Fast)",
+    "description": "MobileNet v2 model option"
+  },
+  "modelInceptionV3": {
+    "message": "InceptionV3 (Accurate)",
+    "description": "InceptionV3 model option"
   }
 }

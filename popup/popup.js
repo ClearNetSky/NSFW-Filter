@@ -7,6 +7,7 @@ const scannedCount = document.getElementById('scannedCount');
 const resetStats = document.getElementById('resetStats');
 const showBankDetails = document.getElementById('showBankDetails');
 const bankDetails = document.getElementById('bankDetails');
+const modelSelect = document.getElementById('modelSelect');
 const languageToggle = document.getElementById('languageToggle');
 
 // Получение текущего языка
@@ -60,6 +61,7 @@ async function loadSettings() {
   const result = await chrome.storage.local.get([
     'enabled',
     'sensitivity',
+    'trainedModel',
     'stats'
   ]);
 
@@ -67,6 +69,7 @@ async function loadSettings() {
   enableFilter.checked = result.enabled !== false;
   sensitivity.value = result.sensitivity ?? 50;
   sensitivityValue.textContent = `${sensitivity.value}%`;
+  modelSelect.value = result.trainedModel ?? 'MobileNet_v2';
   updateSliderTrack();
 
   const stats = result.stats ?? { blocked: 0, scanned: 0 };
@@ -90,7 +93,7 @@ async function saveSettings() {
   const settings = {
     enabled: enableFilter.checked,
     sensitivity: parseInt(sensitivity.value),
-    // Все категории всегда включены
+    trainedModel: modelSelect.value,
     categories: {
       porn: true,
       sexy: true,
@@ -127,6 +130,7 @@ sensitivity.addEventListener('input', () => {
 });
 
 sensitivity.addEventListener('change', saveSettings);
+modelSelect.addEventListener('change', saveSettings);
 
 resetStats.addEventListener('click', async () => {
   await chrome.storage.local.set({
@@ -159,6 +163,10 @@ chrome.storage.onChanged.addListener((changes) => {
     scannedCount.textContent = formatNumber(stats.scanned);
   }
 });
+
+// Версия
+document.getElementById('versionText').textContent =
+  `v${chrome.runtime.getManifest().version} — WebGPU`;
 
 // Инициализация
 loadI18nMessages();
