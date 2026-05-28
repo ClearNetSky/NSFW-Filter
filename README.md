@@ -1,11 +1,11 @@
 # 🛡️ NSFW Filter
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Stars](https://img.shields.io/github/stars/AristarhUcolov/NSFW-Filter?style=social)](https://github.com/AristarhUcolov/NSFW-Filter/stargazers)
-[![GitHub Issues](https://img.shields.io/github/issues/AristarhUcolov/NSFW-Filter)](https://github.com/AristarhUcolov/NSFW-Filter/issues)
-[![GitHub Release](https://img.shields.io/github/v/release/AristarhUcolov/NSFW-Filter?include_prereleases)](https://github.com/AristarhUcolov/NSFW-Filter/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/AristarhUcolov/NSFW-Filter?style=social)](https://github.com/ClearNetSky/NSFW-Filter/stargazers)
+[![GitHub Issues](https://img.shields.io/github/issues/AristarhUcolov/NSFW-Filter)](https://github.com/ClearNetSky/NSFW-Filter/issues)
+[![GitHub Release](https://img.shields.io/github/v/release/AristarhUcolov/NSFW-Filter?include_prereleases)](https://github.com/ClearNetSky/NSFW-Filter/releases)
 [![Chrome Web Store](https://img.shields.io/badge/Chrome-Web%20Store-brightgreen)](https://chromewebstore.google.com/detail/nsfw-filter/nojnjhlhdhfaghkgdgdcobjnoeghkopg)
-[![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/AristarhUcolov/NSFW-Filter)
+[![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/ClearNetSky/NSFW-Filter)
 
 [🇷🇺 Русский](#russian) | [🇬🇧 English](#english)
 
@@ -131,10 +131,8 @@ MIT License
 **☕ Buy Me a Coffee:**
 [buymeacoffee.com/aristarh.ucolov](https://buymeacoffee.com/aristarh.ucolov)
 
-**🏦 Банковский перевод:**
-- **Банк:** Moldindconbank
-- **Карта:** `4028 1202 1106 0963`
-- **Получатель:** Aristarh Ucolov
+**💜 DonationAlerts:**
+[donationalerts.com/r/aristarh_ucolov](https://www.donationalerts.com/r/aristarh_ucolov)
 
 ## 🙏 Благодарности
 
@@ -263,10 +261,8 @@ If this extension helped you, you can support development:
 **☕ Buy Me a Coffee:**
 [buymeacoffee.com/aristarh.ucolov](https://buymeacoffee.com/aristarh.ucolov)
 
-**🏦 Bank Transfer:**
-- **Bank:** Moldindconbank
-- **Card:** `4028 1202 1106 0963`
-- **Recipient:** Aristarh Ucolov
+**💜 DonationAlerts:**
+[donationalerts.com/r/aristarh_ucolov](https://www.donationalerts.com/r/aristarh_ucolov)
 
 Your support helps keep the project going! 🙏
 

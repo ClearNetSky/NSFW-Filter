@@ -5,8 +5,6 @@ const sensitivityValue = document.getElementById('sensitivityValue');
 const blockedCount = document.getElementById('blockedCount');
 const scannedCount = document.getElementById('scannedCount');
 const resetStats = document.getElementById('resetStats');
-const showBankDetails = document.getElementById('showBankDetails');
-const bankDetails = document.getElementById('bankDetails');
 const modelSelect = document.getElementById('modelSelect');
 const languageToggle = document.getElementById('languageToggle');
 
@@ -144,11 +142,6 @@ resetStats.addEventListener('click', async () => {
   });
   blockedCount.textContent = '0';
   scannedCount.textContent = '0';
-});
-
-// Показать/скрыть банковские реквизиты
-showBankDetails.addEventListener('click', () => {
-  bankDetails.classList.toggle('hidden');
 });
 
 // Переключение языка
