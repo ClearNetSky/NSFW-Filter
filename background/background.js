@@ -1,10 +1,9 @@
-// Background Service Worker — NSFW Filter v8.0
+// Background Service Worker — NSFW Filter v8.2
 // Routes prediction requests: content.js → offscreen.js
 // Manages offscreen document lifecycle, stats, and tab tracking
 // Architecture matches reference extension (3-layer, no sandbox)
 
 const OFFSCREEN_PATH = 'offscreen/offscreen.html';
-const STORAGE_KEY = 'nsfw-filter-settings';
 
 // ═══════════════════════════════════════════════════════════════
 // PENDING REQUESTS — requestId → sendResponse callback
@@ -12,6 +11,29 @@ const STORAGE_KEY = 'nsfw-filter-settings';
 
 const pendingRequests = new Map();
 let requestCounter = 0;
+
+// Failsafe: если offscreen не ответил за 30с (крэш, перезагрузка модели),
+// отвечаем fail-open и чистим запись — иначе Map растёт бесконечно
+const PENDING_TIMEOUT = 30000;
+
+function addPendingRequest(requestId, sendResponse, url) {
+  const timer = setTimeout(() => {
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      pendingRequests.delete(requestId);
+      try { pending.respond({ result: false, url, message: 'Prediction timeout' }); } catch {}
+    }
+  }, PENDING_TIMEOUT);
+  pendingRequests.set(requestId, { respond: sendResponse, timer });
+}
+
+function resolvePendingRequest(requestId, payload) {
+  const pending = pendingRequests.get(requestId);
+  if (!pending) return;
+  pendingRequests.delete(requestId);
+  clearTimeout(pending.timer);
+  try { pending.respond(payload); } catch {}
+}
 
 // ═══════════════════════════════════════════════════════════════
 // OFFSCREEN DOCUMENT MANAGEMENT
@@ -38,16 +60,19 @@ async function ensureOffscreenDocument() {
     justification: 'NSFW image classification using TensorFlow.js with WebGPU'
   });
 
-  await creatingOffscreen;
-  creatingOffscreen = null;
+  try {
+    await creatingOffscreen;
+  } finally {
+    // Сбрасываем и при ошибке — иначе все последующие вызовы будут
+    // ждать тот же rejected promise и падать вечно
+    creatingOffscreen = null;
+  }
 
   // Send initial settings to offscreen
   const settings = await readSettings();
-  const stats = await readStats();
   chrome.runtime.sendMessage({
     type: 'OFFSCREEN_INIT',
-    settings,
-    totalBlocked: stats.blocked || 0
+    settings
   }).catch(() => {});
 
   console.log('NSFW Filter: Offscreen document created (WebGPU, no sandbox)');
@@ -65,11 +90,6 @@ async function readSettings() {
     categories: result.categories ?? { porn: true, sexy: true, hentai: true },
     trainedModel: result.trainedModel ?? 'MobileNet_v2'
   };
-}
-
-async function readStats() {
-  const result = await chrome.storage.local.get('stats');
-  return result.stats ?? { blocked: 0, scanned: 0 };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -114,24 +134,10 @@ ensureOffscreenDocument().catch(console.error);
 // ═══════════════════════════════════════════════════════════════
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Stats update from offscreen (it can't access chrome.storage)
-  if (message.type === 'OFFSCREEN_TOTAL_BLOCKED') {
-    chrome.storage.local.get('stats').then(result => {
-      const stats = result.stats ?? { blocked: 0, scanned: 0 };
-      stats.blocked = message.totalBlocked;
-      chrome.storage.local.set({ stats });
-    });
-    return;
-  }
-
   // Prediction result from offscreen → forward to content script
   if (message.type === 'PREDICTION_RESULT') {
     const { requestId, result, url, error } = message;
-    const pending = pendingRequests.get(requestId);
-    if (pending) {
-      pendingRequests.delete(requestId);
-      pending({ result, url, message: error || '' });
-    }
+    resolvePendingRequest(requestId, { result, url, message: error || '' });
     return;
   }
 
@@ -167,7 +173,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       tabUrl: sender.tab?.url ?? ''
     };
 
-    pendingRequests.set(requestId, sendResponse);
+    addPendingRequest(requestId, sendResponse, message.url);
 
     ensureOffscreenDocument()
       .then(() => chrome.runtime.sendMessage({
@@ -177,11 +183,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         tabIdUrl
       }))
       .catch(err => {
-        const pending = pendingRequests.get(requestId);
-        if (pending) {
-          pendingRequests.delete(requestId);
-          pending({ result: false, url: message.url, message: err.message });
-        }
+        resolvePendingRequest(requestId, {
+          result: false,
+          url: message.url,
+          message: err.message
+        });
       });
 
     return true; // Keep channel open for async response
@@ -194,12 +200,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 const tabBlockCounts = new Map();
 
-async function updateStats(blocked, scanned, tabId) {
-  const result = await chrome.storage.local.get('stats');
-  const stats = result.stats ?? { blocked: 0, scanned: 0 };
-  stats.blocked += blocked;
-  stats.scanned += scanned;
-  await chrome.storage.local.set({ stats });
+// Последовательная запись статистики: параллельные get→set из разных
+// вкладок теряли обновления (оба читают старое значение)
+let statsWriteChain = Promise.resolve();
+
+function updateStats(blocked, scanned, tabId) {
+  statsWriteChain = statsWriteChain.then(async () => {
+    const result = await chrome.storage.local.get('stats');
+    const stats = result.stats ?? { blocked: 0, scanned: 0 };
+    stats.blocked += blocked;
+    stats.scanned += scanned;
+    await chrome.storage.local.set({ stats });
+  }).catch(() => {});
 
   if (tabId && blocked > 0) {
     const current = tabBlockCounts.get(tabId) || 0;
@@ -256,14 +268,3 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   }).catch(() => {});
 });
 
-// When popup disconnects (settings changed), clear offscreen cache
-chrome.runtime.onConnect.addListener((port) => {
-  port.onDisconnect.addListener(() => {
-    readSettings().then(settings => {
-      chrome.runtime.sendMessage({
-        type: 'OFFSCREEN_CLEAR_CACHE',
-        settings
-      }).catch(() => {});
-    });
-  });
-});

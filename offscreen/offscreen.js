@@ -22,8 +22,6 @@ let settings = {
   trainedModel: 'MobileNet_v2' // 'MobileNet_v2' | 'InceptionV3'
 };
 
-let totalBlocked = 0;
-
 // ═══════════════════════════════════════════════════════════════
 // LRU CACHE — shared across all tabs
 // ═══════════════════════════════════════════════════════════════
@@ -64,6 +62,22 @@ class LRUCache {
 
 const cache = new LRUCache(500);
 
+// Ключ кэша: data URL бывают по 10–50КБ — хранить их как ключи Map
+// в кэше и requestMap расточительно (до ~25МБ на 500 записей).
+// Для длинных URL используем двойной FNV-1a хеш + длину (128 бит
+// энтропии на практике — коллизии исключены)
+function cacheKey(url) {
+  if (url.length <= 512) return url;
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (let i = 0; i < url.length; i++) {
+    const c = url.charCodeAt(i);
+    a = Math.imul(a ^ c, 16777619) >>> 0;
+    b = (Math.imul(b ^ c, 2166136261) + i) >>> 0;
+  }
+  return `h:${url.length}:${a.toString(36)}:${b.toString(36)}`;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // CONCURRENT QUEUE — generic queue with concurrency control
 // ═══════════════════════════════════════════════════════════════
@@ -80,8 +94,10 @@ class ConcurrentQueue {
     this.active = 0;
   }
 
-  add(item) {
-    this.queue.push(item);
+  // priority=true — в начало очереди (запросы с активной вкладки)
+  add(item, priority) {
+    if (priority) this.queue.unshift(item);
+    else this.queue.push(item);
     this._drain();
   }
 
@@ -119,12 +135,17 @@ let modelSize = 224; // MobileNet=224, InceptionV3=299
 let loadAttempts = 0;
 const FILTER_LIST = new Set(['Hentai', 'Porn', 'Sexy']);
 
-// Request deduplication: URL → array of [{resolve, reject}]
+// Request deduplication: cacheKey(URL) → array of [{resolve, reject}]
 const requestMap = new Map();
 
 // Tab tracking
 const currentTabIdUrls = new Map();
 let activeTabId = null;
+
+// Запросы с активной вкладки обрабатываются первыми
+function isActiveTab(tabIdUrl) {
+  return !!tabIdUrl && tabIdUrl.tabId !== null && tabIdUrl.tabId === activeTabId;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // LOADING QUEUE — loads images from URLs (100 concurrent, 5s timeout)
@@ -134,29 +155,29 @@ let activeTabId = null;
 const loadingQueue = new ConcurrentQueue({
   concurrency: 100,
   timeout: 0,
-  onProcess: ({ url, tabIdUrl }, callback) => {
+  onProcess: ({ url, key, tabIdUrl }, callback) => {
     // Skip if tab navigated away
     if (tabIdUrl && tabIdUrl.tabId !== null) {
       const currentUrl = currentTabIdUrls.get(tabIdUrl.tabId);
       if (currentUrl !== undefined && currentUrl !== tabIdUrl.tabUrl) {
-        callback({ url, error: new Error('Tab navigated away') });
+        callback({ key, error: new Error('Tab navigated away') });
         return;
       }
     }
 
     let done = false;
     const timer = setTimeout(() => {
-      if (!done) { done = true; callback({ url, error: new Error('Image load timeout') }); }
-    }, 3000);
+      if (!done) { done = true; callback({ key, error: new Error('Image load timeout') }); }
+    }, 5000);
 
     // Data URLs: load directly (no fetch needed)
     if (url.startsWith('data:')) {
       const image = new Image(modelSize, modelSize);
       image.onload = () => {
-        if (!done) { done = true; clearTimeout(timer); callback(null, { url, image, tabIdUrl }); }
+        if (!done) { done = true; clearTimeout(timer); callback(null, { url, key, image, tabIdUrl }); }
       };
       image.onerror = () => {
-        if (!done) { done = true; clearTimeout(timer); callback({ url, error: new Error('Data URL load failed') }); }
+        if (!done) { done = true; clearTimeout(timer); callback({ key, error: new Error('Data URL load failed') }); }
       };
       image.src = url;
       return;
@@ -173,30 +194,31 @@ const loadingQueue = new ConcurrentQueue({
         const image = new Image(modelSize, modelSize);
         image.onload = () => {
           URL.revokeObjectURL(blobUrl);
-          if (!done) { done = true; clearTimeout(timer); callback(null, { url, image, tabIdUrl }); }
+          if (!done) { done = true; clearTimeout(timer); callback(null, { url, key, image, tabIdUrl }); }
         };
         image.onerror = () => {
           URL.revokeObjectURL(blobUrl);
-          if (!done) { done = true; clearTimeout(timer); callback({ url, error: new Error('Blob image load failed') }); }
+          if (!done) { done = true; clearTimeout(timer); callback({ key, error: new Error('Blob image load failed') }); }
         };
         image.src = blobUrl;
       })
       .catch(err => {
-        if (!done) { done = true; clearTimeout(timer); callback({ url, error: err }); }
+        if (!done) { done = true; clearTimeout(timer); callback({ key, error: err }); }
       });
   },
-  onSuccess: ({ url, image, tabIdUrl }) => {
-    if (!requestMap.has(url)) return;
-    predictionQueue.add({ url, image, tabIdUrl });
+  onSuccess: ({ url, key, image, tabIdUrl }) => {
+    if (!requestMap.has(key)) return;
+    predictionQueue.add({ url, key, image, tabIdUrl }, isActiveTab(tabIdUrl));
   },
-  onFailure: ({ url, error }) => {
-    if (!requestMap.has(url)) return;
-    cache.set(url, false);
-    const waiters = requestMap.get(url);
+  onFailure: ({ key, error }) => {
+    if (!requestMap.has(key)) return;
+    // Сбой загрузки НЕ кэшируем: временная сетевая ошибка не должна
+    // навсегда помечать URL как безопасный
+    const waiters = requestMap.get(key);
     if (waiters) {
       for (const { reject } of waiters) reject(error);
     }
-    requestMap.delete(url);
+    requestMap.delete(key);
   }
 });
 
@@ -207,36 +229,35 @@ const loadingQueue = new ConcurrentQueue({
 const predictionQueue = new ConcurrentQueue({
   concurrency: 1,
   timeout: 0,
-  onProcess: ({ url, image, tabIdUrl }, callback) => {
-    if (!requestMap.has(url)) {
-      callback({ url, error: new Error('Request cancelled') });
+  onProcess: ({ url, key, image }, callback) => {
+    if (!requestMap.has(key)) {
+      callback({ key, error: new Error('Request cancelled') });
       return;
     }
 
     predictImage(image, url)
-      .then(result => callback(null, { url, result }))
-      .catch(error => callback({ url, error }));
+      .then(result => callback(null, { key, result }))
+      .catch(error => callback({ key, error }));
   },
-  onSuccess: ({ url, result }) => {
-    if (!requestMap.has(url)) return;
+  onSuccess: ({ key, result }) => {
+    if (!requestMap.has(key)) return;
 
-    if (result) totalBlocked++;
-    cache.set(url, result);
+    cache.set(key, result);
 
-    const waiters = requestMap.get(url);
+    const waiters = requestMap.get(key);
     if (waiters) {
       for (const { resolve } of waiters) resolve(result);
     }
-    requestMap.delete(url);
+    requestMap.delete(key);
   },
-  onFailure: ({ url, error }) => {
-    if (!requestMap.has(url)) return;
-    cache.set(url, false);
-    const waiters = requestMap.get(url);
+  onFailure: ({ key, error }) => {
+    if (!requestMap.has(key)) return;
+    // Ошибку классификации не кэшируем — она может быть временной
+    const waiters = requestMap.get(key);
     if (waiters) {
       for (const { reject } of waiters) reject(error);
     }
-    requestMap.delete(url);
+    requestMap.delete(key);
   }
 });
 
@@ -259,6 +280,11 @@ const predictionQueue = new ConcurrentQueue({
 // 2. Если "безопасные" классы (Drawing + Neutral) доминируют → пропускаем
 // 3. Если NSFW-классы превышают порог → блокируем
 // 4. Используем комбинированный скоринг для лучшей точности
+//
+// ВАЖНО (v2.2): на NSFW-рисунках модель делит вероятность между Drawing
+// и Hentai (например 0.45/0.40), поэтому нельзя требовать от Hentai
+// высокого абсолютного скора и нельзя штрафовать Hentai за высокий
+// Drawing — иначе хентай-рисунки систематически проходят фильтр.
 
 function analyzeResults(predictions) {
   // Порог чувствительности: sensitivity 0 → threshold 1.0, sensitivity 100 → threshold 0.0
@@ -294,20 +320,37 @@ function analyzeResults(predictions) {
   const categories = settings.categories || { porn: true, sexy: true, hentai: true };
   let shouldBlock = false;
 
+  // Топ-класс предсказания (какой класс модель считает самым вероятным)
+  let topClass = 'neutral';
+  let topScore = 0;
+  for (const cls in scores) {
+    if (scores[cls] > topScore) {
+      topScore = scores[cls];
+      topClass = cls;
+    }
+  }
+
   // Проверяем PORN
   if (categories.porn && scores.porn >= threshold) {
     shouldBlock = true;
   }
 
-  // Проверяем HENTAI
-  // Учитываем разницу между Drawing и Hentai:
-  // если Drawing-скор высокий, повышаем порог для Hentai
-  if (categories.hentai) {
-    let hentaiThreshold = threshold;
-    if (scores.drawing > 0.3) {
-      hentaiThreshold = Math.min(threshold + 0.15, 0.95);
-    }
-    if (scores.hentai >= hentaiThreshold) {
+  // Проверяем HENTAI (NSFW-рисунки)
+  // Минимальный «пол»: ниже него Hentai-сигнал считаем шумом,
+  // чтобы не блокировать безобидные аниме/иллюстрации
+  if (categories.hentai && !shouldBlock) {
+    const hentaiFloor = Math.max(0.25, threshold * 0.5);
+
+    if (scores.hentai >= threshold) {
+      // Уверенный Hentai — блокируем без оглядки на Drawing
+      shouldBlock = true;
+    } else if (topClass === 'hentai' && scores.hentai >= hentaiFloor) {
+      // Hentai — доминирующий класс: блокируем даже при «размазанном»
+      // скоре (типичный случай для MobileNet на хентай-рисунках)
+      shouldBlock = true;
+    } else if (scores.hentai >= hentaiFloor &&
+               scores.hentai + scores.porn > safeScore) {
+      // NSFW-масса (hentai+porn) перевешивает безопасную (drawing+neutral)
       shouldBlock = true;
     }
   }
@@ -339,31 +382,66 @@ function analyzeResults(predictions) {
   return shouldBlock;
 }
 
+// Восстановление после потери GPU-контекста (актуально для WebGL):
+// переинициализируем бэкенд и модель, одна попытка на инцидент
+let backendRecovery = null;
+
 async function predictImage(image, url) {
   if (!model) throw new Error('Model not loaded');
 
-  const predictions = await model.classify(image, 5);
-  return analyzeResults(predictions);
+  try {
+    const predictions = await model.classify(image, 5);
+    return analyzeResults(predictions);
+  } catch (e) {
+    const msg = e.message || '';
+    const isContextError = /context.?lost|shader|framebuffer|no texture|INVALID_OPERATION/i.test(msg);
+    if (!isContextError) throw e;
+
+    if (!backendRecovery) {
+      console.warn('NSFW Offscreen: GPU context error, reinitializing backend...');
+      backendRecovery = (async () => {
+        model = null;
+        loadAttempts = 0;
+        await initBackend();
+        await loadModel();
+      })().finally(() => { backendRecovery = null; });
+    }
+    await backendRecovery;
+
+    if (!model) throw e;
+    const predictions = await model.classify(image, 5);
+    return analyzeResults(predictions);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // PUBLIC API — predict with cache + deduplication
 // ═══════════════════════════════════════════════════════════════
 
+// Отвечает всем ожидающим запросам fail-open (false = показать картинку),
+// чтобы при смене модели/очистке очередей картинки не остались скрытыми навсегда
+function resolveAllPending() {
+  for (const waiters of requestMap.values()) {
+    for (const { resolve } of waiters) resolve(false);
+  }
+  requestMap.clear();
+}
+
 function predict(url, tabIdUrl) {
+  const key = cacheKey(url);
   return new Promise((resolve, reject) => {
     // Check cache first
-    if (cache.has(url)) {
-      resolve(cache.get(url));
+    if (cache.has(key)) {
+      resolve(cache.get(key));
       return;
     }
 
     // Deduplication: if already loading/predicting this URL, just add another waiter
-    if (requestMap.has(url)) {
-      requestMap.get(url).push({ resolve, reject });
+    if (requestMap.has(key)) {
+      requestMap.get(key).push({ resolve, reject });
     } else {
-      requestMap.set(url, [{ resolve, reject }]);
-      loadingQueue.add({ url, tabIdUrl });
+      requestMap.set(key, [{ resolve, reject }]);
+      loadingQueue.add({ url, key, tabIdUrl }, isActiveTab(tabIdUrl));
     }
   });
 }
@@ -372,21 +450,41 @@ function predict(url, tabIdUrl) {
 // MODEL LOADING — WebGPU → CPU fallback
 // ═══════════════════════════════════════════════════════════════
 
-async function initBackend() {
-  // WebGPU doesn't use eval — works within MV3 CSP
-  try {
-    await tf.setBackend('webgpu');
-    await tf.ready();
-    console.log('NSFW Offscreen: WebGPU backend active');
-    return;
-  } catch (e) {
-    console.warn('NSFW Offscreen: WebGPU unavailable, falling back to CPU:', e.message);
-  }
+// Chrome на Windows игнорирует powerPreference в requestAdapter и пишет
+// предупреждение в консоль при каждом старте (crbug.com/369219127).
+// TF.js всегда передаёт эту опцию — вырезаем её сами, только на Windows
+// (на macOS с двумя GPU опция работает и полезна)
+if (navigator.gpu?.requestAdapter && navigator.userAgent.includes('Windows')) {
+  const originalRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+  navigator.gpu.requestAdapter = (options) => {
+    if (options && 'powerPreference' in options) {
+      const { powerPreference, ...rest } = options;
+      return originalRequestAdapter(rest);
+    }
+    return originalRequestAdapter(options);
+  };
+}
 
-  // CPU fallback (always works, no CSP issues)
-  await tf.setBackend('cpu');
-  await tf.ready();
-  console.log('NSFW Offscreen: CPU backend active (fallback)');
+async function initBackend() {
+  // Цепочка: WebGPU (быстрее всего) → WebGL (GPU на машинах без WebGPU)
+  // → CPU (гарантированный запасной). Ни один не требует unsafe-eval.
+  // tf.setBackend может вернуть false БЕЗ исключения, если фабрика
+  // бэкенда не смогла инициализироваться — проверяем оба случая
+  for (const backendName of ['webgpu', 'webgl', 'cpu']) {
+    try {
+      const ok = await tf.setBackend(backendName);
+      if (!ok) {
+        console.warn(`NSFW Offscreen: ${backendName} unavailable, trying next`);
+        continue;
+      }
+      await tf.ready();
+      console.log(`NSFW Offscreen: ${backendName} backend active`);
+      return;
+    } catch (e) {
+      console.warn(`NSFW Offscreen: ${backendName} failed (${e.message}), trying next`);
+    }
+  }
+  console.error('NSFW Offscreen: All backends failed');
 }
 
 async function loadModel() {
@@ -407,6 +505,19 @@ async function loadModel() {
     loadAttempts++;
     if (loadAttempts < 5) {
       setTimeout(loadModel, 200);
+    } else {
+      // Модель так и не загрузилась — отвечаем fail-open всем буферизованным
+      // запросам, иначе картинки на страницах останутся скрытыми
+      for (const { url, requestId } of buffered) {
+        chrome.runtime.sendMessage({
+          type: 'PREDICTION_RESULT',
+          requestId,
+          result: false,
+          url,
+          error: 'Model load failed'
+        }).catch(() => {});
+      }
+      buffered.length = 0;
     }
   }
 }
@@ -454,7 +565,6 @@ function flushBuffered() {
 chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   if (message.type === 'OFFSCREEN_INIT') {
     Object.assign(settings, message.settings || {});
-    totalBlocked = message.totalBlocked || 0;
   }
 
   if (message.type === 'OFFSCREEN_PREDICT') {
@@ -482,8 +592,9 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     if (settings.trainedModel !== oldModel) {
       console.log(`NSFW Offscreen: Model changed ${oldModel} → ${settings.trainedModel}, reloading...`);
       model = null;
+      loadAttempts = 0;
       cache.clear();
-      requestMap.clear();
+      resolveAllPending();
       loadingQueue.clear();
       predictionQueue.clear();
       loadModel().then(flushBuffered);
@@ -493,20 +604,6 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     }
   }
 
-  if (message.type === 'OFFSCREEN_CLEAR_CACHE') {
-    if (message.settings) Object.assign(settings, message.settings);
-    cache.clear();
-    requestMap.clear();
-    loadingQueue.clear();
-    predictionQueue.clear();
-  }
-
-  if (message.type === 'OFFSCREEN_TOTAL_BLOCKED_REQUEST') {
-    chrome.runtime.sendMessage({
-      type: 'OFFSCREEN_TOTAL_BLOCKED',
-      totalBlocked
-    }).catch(() => {});
-  }
 });
 
 // ═══════════════════════════════════════════════════════════════
