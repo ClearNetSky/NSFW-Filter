@@ -60,7 +60,29 @@ class LRUCache {
   }
 }
 
-const cache = new LRUCache(500);
+const cache = new LRUCache(3000);
+
+// ═══════════════════════════════════════════════════════════════
+// PERSISTENT VERDICT CACHE — вердикты переживают перезапуск браузера.
+// У offscreen-документа нет доступа к chrome.storage: буферизуем свежие
+// вердикты и раз в 5с отправляем в background на сохранение; при старте
+// background присылает сохранённое в OFFSCREEN_INIT (сидируем LRU) —
+// повторный заход на сайт = мгновенные вердикты без классификации
+// ═══════════════════════════════════════════════════════════════
+
+let persistBuffer = [];
+let persistTimer = null;
+
+function schedulePersist(key, result) {
+  persistBuffer.push([key, result]);
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const entries = persistBuffer;
+    persistBuffer = [];
+    chrome.runtime.sendMessage({ type: 'PERSIST_VERDICTS', entries }).catch(() => {});
+  }, 5000);
+}
 
 // Ключ кэша: data URL бывают по 10–50КБ — хранить их как ключи Map
 // в кэше и requestMap расточительно (до ~25МБ на 500 записей).
@@ -133,7 +155,25 @@ class ConcurrentQueue {
 let model = null;
 let modelSize = 224; // MobileNet=224, InceptionV3=299
 let loadAttempts = 0;
-const FILTER_LIST = new Set(['Hentai', 'Porn', 'Sexy']);
+
+// Таймауты: зависший GPU (кривой драйвер, потеря контекста) не должен
+// заклинить загрузку модели или очередь предсказаний навечно
+const MODEL_LOAD_TIMEOUT = 15000;
+const WARMUP_TIMEOUT = 8000;
+const PREDICTION_TIMEOUT = 10000;
+
+// Отклоняет промис, если тот не завершился за ms: «зависание» (а не только
+// исключение) в GPU-коде становится обычной ошибкой, и вызывающий код
+// восстанавливается — фолбэк бэкенда, fail-open картинки
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      value => { clearTimeout(timer); resolve(value); },
+      error => { clearTimeout(timer); reject(error); }
+    );
+  });
+}
 
 // Request deduplication: cacheKey(URL) → array of [{resolve, reject}]
 const requestMap = new Map();
@@ -151,6 +191,33 @@ function isActiveTab(tabIdUrl) {
 // LOADING QUEUE — loads images from URLs (100 concurrent, 5s timeout)
 // Uses fetch() + blob to bypass CORS restrictions (host_permissions)
 // ═══════════════════════════════════════════════════════════════
+
+// Загружает и декодирует картинку для классификации.
+// createImageBitmap с resize: декодирование + даунскейл до modelSize за один
+// шаг, вне основного потока — фото 4000px не разворачивается в полный размер
+// (заметно быстрее и меньше памяти). Фолбэк на <img> для форматов, которые
+// createImageBitmap не осилил. fetch работает и для data:, и для http(s),
+// а с host_permissions обходит CORS-ограничения CDN.
+async function loadImageForClassification(url) {
+  const res = await fetch(url, { mode: 'cors', credentials: 'omit' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+
+  try {
+    return await createImageBitmap(blob, {
+      resizeWidth: modelSize,
+      resizeHeight: modelSize
+    });
+  } catch {
+    return await new Promise((resolve, reject) => {
+      const blobUrl = URL.createObjectURL(blob);
+      const image = new Image(modelSize, modelSize);
+      image.onload = () => { URL.revokeObjectURL(blobUrl); resolve(image); };
+      image.onerror = () => { URL.revokeObjectURL(blobUrl); reject(new Error('Image decode failed')); };
+      image.src = blobUrl;
+    });
+  }
+}
 
 const loadingQueue = new ConcurrentQueue({
   concurrency: 100,
@@ -170,37 +237,15 @@ const loadingQueue = new ConcurrentQueue({
       if (!done) { done = true; callback({ key, error: new Error('Image load timeout') }); }
     }, 5000);
 
-    // Data URLs: load directly (no fetch needed)
-    if (url.startsWith('data:')) {
-      const image = new Image(modelSize, modelSize);
-      image.onload = () => {
-        if (!done) { done = true; clearTimeout(timer); callback(null, { url, key, image, tabIdUrl }); }
-      };
-      image.onerror = () => {
-        if (!done) { done = true; clearTimeout(timer); callback({ key, error: new Error('Data URL load failed') }); }
-      };
-      image.src = url;
-      return;
-    }
-
-    // HTTP URLs: fetch as blob to bypass CORS, then load into Image
-    fetch(url, { mode: 'cors', credentials: 'omit' })
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.blob();
-      })
-      .then(blob => {
-        const blobUrl = URL.createObjectURL(blob);
-        const image = new Image(modelSize, modelSize);
-        image.onload = () => {
-          URL.revokeObjectURL(blobUrl);
-          if (!done) { done = true; clearTimeout(timer); callback(null, { url, key, image, tabIdUrl }); }
-        };
-        image.onerror = () => {
-          URL.revokeObjectURL(blobUrl);
-          if (!done) { done = true; clearTimeout(timer); callback({ key, error: new Error('Blob image load failed') }); }
-        };
-        image.src = blobUrl;
+    loadImageForClassification(url)
+      .then(image => {
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          callback(null, { url, key, image, tabIdUrl });
+        } else if (typeof image.close === 'function') {
+          image.close(); // таймаут уже сработал — не течём ImageBitmap'ом
+        }
       })
       .catch(err => {
         if (!done) { done = true; clearTimeout(timer); callback({ key, error: err }); }
@@ -230,19 +275,27 @@ const predictionQueue = new ConcurrentQueue({
   concurrency: 1,
   timeout: 0,
   onProcess: ({ url, key, image }, callback) => {
+    // Освобождаем ImageBitmap сразу после предикта (у <img> close нет)
+    const closeImage = () => {
+      if (image && typeof image.close === 'function') image.close();
+    };
+
     if (!requestMap.has(key)) {
+      closeImage();
       callback({ key, error: new Error('Request cancelled') });
       return;
     }
 
     predictImage(image, url)
       .then(result => callback(null, { key, result }))
-      .catch(error => callback({ key, error }));
+      .catch(error => callback({ key, error }))
+      .finally(closeImage);
   },
   onSuccess: ({ key, result }) => {
     if (!requestMap.has(key)) return;
 
     cache.set(key, result);
+    schedulePersist(key, result);
 
     const waiters = requestMap.get(key);
     if (waiters) {
@@ -390,11 +443,16 @@ async function predictImage(image, url) {
   if (!model) throw new Error('Model not loaded');
 
   try {
-    const predictions = await model.classify(image, 5);
+    // Таймаут обязателен: очередь предсказаний последовательная, один
+    // зависший GPU-инференс заклинил бы все картинки за ним
+    const predictions = await withTimeout(
+      model.classify(image, 5), PREDICTION_TIMEOUT, 'Prediction');
     return analyzeResults(predictions);
   } catch (e) {
     const msg = e.message || '';
-    const isContextError = /context.?lost|shader|framebuffer|no texture|INVALID_OPERATION/i.test(msg);
+    // Таймаут — тоже признак зависшего GPU: восстановление переинициализирует
+    // бэкенд, а если и прогрев зависнет — loadModel спустит на ступень ниже
+    const isContextError = /context.?lost|shader|framebuffer|no texture|INVALID_OPERATION|timed out/i.test(msg);
     if (!isContextError) throw e;
 
     if (!backendRecovery) {
@@ -409,7 +467,8 @@ async function predictImage(image, url) {
     await backendRecovery;
 
     if (!model) throw e;
-    const predictions = await model.classify(image, 5);
+    const predictions = await withTimeout(
+      model.classify(image, 5), PREDICTION_TIMEOUT, 'Prediction');
     return analyzeResults(predictions);
   }
 }
@@ -465,26 +524,60 @@ if (navigator.gpu?.requestAdapter && navigator.userAgent.includes('Windows')) {
   };
 }
 
-async function initBackend() {
-  // Цепочка: WebGPU (быстрее всего) → WebGL (GPU на машинах без WebGPU)
-  // → CPU (гарантированный запасной). Ни один не требует unsafe-eval.
-  // tf.setBackend может вернуть false БЕЗ исключения, если фабрика
-  // бэкенда не смогла инициализироваться — проверяем оба случая
-  for (const backendName of ['webgpu', 'webgl', 'cpu']) {
-    try {
-      const ok = await tf.setBackend(backendName);
-      if (!ok) {
-        console.warn(`NSFW Offscreen: ${backendName} unavailable, trying next`);
-        continue;
-      }
-      await tf.ready();
-      console.log(`NSFW Offscreen: ${backendName} backend active`);
-      return;
-    } catch (e) {
-      console.warn(`NSFW Offscreen: ${backendName} failed (${e.message}), trying next`);
+// Цепочка: WebGPU (быстрее всего) → WebGL (GPU на машинах без WebGPU)
+// → WASM (SIMD, в разы быстрее голого CPU) → CPU (гарантированный запасной).
+// WASM требует 'wasm-unsafe-eval' в CSP манифеста; JS eval не нужен никому.
+// backendIndex — текущая ступень: провал ПРОГРЕВА модели (см. loadModel)
+// опускает на следующую, т.к. бэкенд может зарегистрироваться успешно,
+// но зависнуть на первом реальном инференсе
+const BACKEND_ORDER = ['webgpu', 'webgl', 'wasm', 'cpu'];
+let backendIndex = 0;
+let wasmConfigured = false;
+
+async function trySetBackend(name) {
+  try {
+    if (name === 'wasm' && !wasmConfigured) {
+      wasmConfigured = true;
+      // Пути к .wasm файлам (лежат в lib/ рядом с бандлом)
+      setWasmPaths(chrome.runtime.getURL('lib/'));
+      // Многопоточный вариант спавнит воркеры из blob: — MV3 CSP это
+      // запрещает; одного потока достаточно для одной картинки за раз
+      tf.env().set('WASM_HAS_MULTITHREAD_SUPPORT', false);
     }
+    // tf.setBackend может вернуть false БЕЗ исключения, если фабрика
+    // бэкенда не смогла инициализироваться — проверяем оба случая
+    const ok = await tf.setBackend(name);
+    if (!ok) return false;
+    await tf.ready();
+    return true;
+  } catch (e) {
+    console.warn(`NSFW Offscreen: ${name} failed (${e.message})`);
+    return false;
+  }
+}
+
+async function initBackend() {
+  while (backendIndex < BACKEND_ORDER.length) {
+    if (await trySetBackend(BACKEND_ORDER[backendIndex])) {
+      console.log(`NSFW Offscreen: ${BACKEND_ORDER[backendIndex]} backend active`);
+      return true;
+    }
+    backendIndex++;
   }
   console.error('NSFW Offscreen: All backends failed');
+  return false;
+}
+
+// Прогрев: первый инференс компилирует WebGPU-пайплайны / WebGL-шейдеры —
+// на холодном GPU это секунды. Без прогрева эту цену платит ПЕРВАЯ реальная
+// картинка каждой сессии (пользователь видит «медленный старт»). Заодно это
+// валидация бэкенда: регистрация может пройти на GPU, который зависает на
+// настоящем графе — гоняем полный classify по пустому canvas с таймаутом
+async function warmUpModel(loadedModel) {
+  const canvas = document.createElement('canvas');
+  canvas.width = modelSize;
+  canvas.height = modelSize;
+  await withTimeout(loadedModel.classify(canvas, 5), WARMUP_TIMEOUT, 'Model warm-up');
 }
 
 async function loadModel() {
@@ -498,8 +591,31 @@ async function loadModel() {
   try {
     // Models are Keras format (not graph) — don't specify type
     // nsfwjs auto-detects the format from model.json
-    model = await nsfwjs.load(modelPath, { size: modelSize });
-    console.log(`NSFW Offscreen: ${trainedModel} loaded (backend: ${tf.getBackend()})`);
+    const loaded = await withTimeout(
+      nsfwjs.load(modelPath, { size: modelSize }),
+      MODEL_LOAD_TIMEOUT,
+      'Model load'
+    );
+
+    try {
+      await warmUpModel(loaded);
+    } catch (warmError) {
+      // Модель не прогрелась на текущем бэкенде (обычно проблемный GPU-
+      // драйвер): освобождаем её и перезагружаем на следующем бэкенде.
+      // Рекурсия ограничена длиной BACKEND_ORDER (максимум 2 спуска)
+      try { loaded.dispose?.(); } catch {}
+      if (backendIndex < BACKEND_ORDER.length - 1) {
+        console.warn(`NSFW Offscreen: warm-up failed on ${BACKEND_ORDER[backendIndex]} (${warmError.message}), downgrading backend`);
+        backendIndex++;
+        if (await initBackend()) {
+          return loadModel();
+        }
+      }
+      throw warmError;
+    }
+
+    model = loaded;
+    console.log(`NSFW Offscreen: ${trainedModel} loaded and warm (backend: ${tf.getBackend()})`);
   } catch (error) {
     console.error('NSFW Offscreen: Model load failed:', error);
     loadAttempts++;
@@ -565,6 +681,15 @@ function flushBuffered() {
 chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   if (message.type === 'OFFSCREEN_INIT') {
     Object.assign(settings, message.settings || {});
+    // Сидируем LRU сохранёнными вердиктами (порядок сохранён: старые первыми)
+    if (Array.isArray(message.verdicts)) {
+      for (const entry of message.verdicts) {
+        if (Array.isArray(entry) && typeof entry[0] === 'string') {
+          cache.set(entry[0], entry[1] === true);
+        }
+      }
+      console.log(`NSFW Offscreen: seeded ${message.verdicts.length} cached verdicts`);
+    }
   }
 
   if (message.type === 'OFFSCREEN_PREDICT') {
@@ -591,6 +716,8 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     // If model changed, reload it
     if (settings.trainedModel !== oldModel) {
       console.log(`NSFW Offscreen: Model changed ${oldModel} → ${settings.trainedModel}, reloading...`);
+      // Освобождаем тензоры старой модели — иначе обе резидентны в GPU-памяти
+      try { model?.dispose?.(); } catch {}
       model = null;
       loadAttempts = 0;
       cache.clear();

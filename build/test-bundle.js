@@ -34,10 +34,14 @@ require('../lib/tfjs-nsfwjs-webgpu.min.js');
   let failed = false;
 
   // 1. Бэкенды зарегистрированы (webgpu виден только при navigator.gpu — не проверяем)
-  for (const b of ['webgl', 'cpu']) {
+  for (const b of ['webgl', 'wasm', 'cpu']) {
     const ok = tf.findBackendFactory(b) != null;
     console.log(`backend ${b} registered: ${ok ? 'OK' : 'FAIL'}`);
     if (!ok) failed = true;
+  }
+  if (typeof setWasmPaths !== 'function') {
+    console.log('setWasmPaths exposed: FAIL');
+    failed = true;
   }
 
   await tf.setBackend('cpu');

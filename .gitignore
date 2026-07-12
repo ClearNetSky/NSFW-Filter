@@ -19,8 +19,10 @@ Thumbs.db
 # Build dependencies (build sources ARE tracked — see build/package.json)
 node_modules/
 
-# Reference extension (used for comparison only)
+# Reference extensions (used for comparison only; sourcecode/ is GPL-3.0 —
+# must never be committed into this MIT repo)
 Check/
+sourcecode/
 
 # Claude Code
 .claude/

@@ -68,11 +68,13 @@ async function ensureOffscreenDocument() {
     creatingOffscreen = null;
   }
 
-  // Send initial settings to offscreen
+  // Send initial settings + persisted verdicts to offscreen
   const settings = await readSettings();
+  const stored = await chrome.storage.local.get(VERDICT_CACHE_KEY);
   chrome.runtime.sendMessage({
     type: 'OFFSCREEN_INIT',
-    settings
+    settings,
+    verdicts: stored[VERDICT_CACHE_KEY] ?? []
   }).catch(() => {});
 
   console.log('NSFW Filter: Offscreen document created (WebGPU, no sandbox)');
@@ -81,6 +83,34 @@ async function ensureOffscreenDocument() {
 // ═══════════════════════════════════════════════════════════════
 // SETTINGS & STATS
 // ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+// PERSISTENT VERDICT CACHE — offscreen не имеет доступа к chrome.storage,
+// поэтому шлёт вердикты сюда. Формат: массив пар [ключ, boolean],
+// новые в конце; при переполнении отбрасываются старейшие
+// ═══════════════════════════════════════════════════════════════
+
+const VERDICT_CACHE_KEY = 'verdictCache';
+const VERDICT_CACHE_MAX = 3000;
+
+// Последовательная запись — параллельные merge теряли бы вердикты
+let verdictWriteChain = Promise.resolve();
+
+function persistVerdicts(entries) {
+  verdictWriteChain = verdictWriteChain.then(async () => {
+    const result = await chrome.storage.local.get(VERDICT_CACHE_KEY);
+    const map = new Map(result[VERDICT_CACHE_KEY] ?? []);
+    for (const [key, verdict] of entries) {
+      map.delete(key); // переставляем в конец (свежее)
+      map.set(key, verdict === true);
+    }
+    let merged = [...map.entries()];
+    if (merged.length > VERDICT_CACHE_MAX) {
+      merged = merged.slice(merged.length - VERDICT_CACHE_MAX);
+    }
+    await chrome.storage.local.set({ [VERDICT_CACHE_KEY]: merged });
+  }).catch(() => {});
+}
 
 async function readSettings() {
   const result = await chrome.storage.local.get(['enabled', 'sensitivity', 'categories', 'trainedModel']);
@@ -141,6 +171,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  // Fresh verdicts from offscreen → persist to storage
+  if (message.type === 'PERSIST_VERDICTS') {
+    if (Array.isArray(message.entries) && message.entries.length > 0) {
+      persistVerdicts(message.entries);
+    }
+    return;
+  }
+
   // Settings request from content script
   if (message.type === 'GET_SETTINGS') {
     readSettings().then(sendResponse);
@@ -154,8 +192,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  // Settings updated from popup — forward to offscreen
+  // Settings updated from popup — forward to offscreen.
+  // Персистентный кэш вердиктов инвалидируем: чувствительность/модель
+  // изменились, старые вердикты могли стать неверными
   if (message.type === 'SETTINGS_UPDATED') {
+    chrome.storage.local.remove(VERDICT_CACHE_KEY).catch(() => {});
     chrome.runtime.sendMessage({
       type: 'OFFSCREEN_SETTINGS_UPDATED',
       settings: message.settings

@@ -1,5 +1,5 @@
 // Entry point for esbuild bundle
-// Backends: WebGPU (primary), WebGL (fallback), CPU (last resort)
+// Backends: WebGPU (primary), WebGL (fallback), WASM (CPU+SIMD), CPU (last resort)
 //
 // ВАЖНО: @tensorflow/tfjs-core помечен sideEffects:false — esbuild
 // выкидывает side-effect модули при tree-shaking. Chained ops
@@ -11,7 +11,10 @@ import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
 import '@tensorflow/tfjs-backend-webgl';
 import '@tensorflow/tfjs-backend-cpu';
+import { setWasmPaths } from '@tensorflow/tfjs-backend-wasm';
 import { load, NSFWJS } from 'nsfwjs/core';
 
 globalThis.tf = tf;
 globalThis.nsfwjs = { load, NSFWJS };
+// offscreen.js вызывает до setBackend('wasm'): пути к .wasm файлам в lib/
+globalThis.setWasmPaths = setWasmPaths;
