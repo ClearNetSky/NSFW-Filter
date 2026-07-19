@@ -122,10 +122,11 @@ async function saveSettings() {
 // Обработчики событий
 enableFilter.addEventListener('change', saveSettings);
 
-// Обновление цветной полоски слайдера
+// Обновление цветной полоски слайдера (--track из CSS учитывает тему)
 function updateSliderTrack() {
   const val = sensitivity.value;
-  sensitivity.style.background = `linear-gradient(to right, #667eea 0%, #764ba2 ${val}%, #e0e0e0 ${val}%)`;
+  sensitivity.style.background =
+    `linear-gradient(to right, #6d6ff5 0%, #a855f7 ${val}%, var(--track) ${val}%)`;
 }
 
 sensitivity.addEventListener('input', () => {
