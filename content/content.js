@@ -82,6 +82,10 @@
 
   const MIN_IMAGE_SIZE = 32;
   const FAILSAFE_TIMEOUT = 20000; // мс: показать картинку, если вердикт не пришёл
+  // Backstop: CSS прячет картинки с document_start, но настройки читаются
+  // асинхронно. Если service worker не ответит (крэш, перезагрузка), без
+  // этого таймера страница осталась бы БЕЗ КАРТИНОК навсегда
+  const SETTINGS_TIMEOUT = 4000;
 
   // ═══════════════════════════════════════════════════════════════
   // CSS INJECTION — hide images before classification
@@ -249,6 +253,10 @@
   // ═══════════════════════════════════════════════════════════════
 
   let viewportObserver = null;
+  // IntersectionObserver держит СИЛЬНЫЕ ссылки на наблюдаемые элементы:
+  // картинки, удалённые из DOM до попадания во вьюпорт (бесконечная лента),
+  // иначе накапливались бы навсегда. Отслеживаем их и подчищаем при пересканах
+  const observedImages = new Set();
 
   function getViewportObserver() {
     if (viewportObserver) return viewportObserver;
@@ -256,10 +264,27 @@
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
         viewportObserver.unobserve(entry.target);
+        observedImages.delete(entry.target);
         startImagePrediction(entry.target);
       }
     }, { rootMargin: '600px' }); // запас со всех сторон: и скролл, и карусели
     return viewportObserver;
+  }
+
+  function observeForViewport(image) {
+    getViewportObserver().observe(image);
+    observedImages.add(image);
+  }
+
+  // Снимаем наблюдение с элементов, выброшенных из документа
+  function pruneObservedImages() {
+    if (observedImages.size === 0) return;
+    for (const el of observedImages) {
+      if (!el.isConnected) {
+        viewportObserver.unobserve(el);
+        observedImages.delete(el);
+      }
+    }
   }
 
   function analyzeImage(image, isSrcChange) {
@@ -291,7 +316,7 @@
     // Mark as processing — CSS rule hides it. Предсказание запустится,
     // когда картинка приблизится к вьюпорту (повторный observe — no-op)
     image.dataset.nsfwFilterStatus = 'processing';
-    getViewportObserver().observe(image);
+    observeForViewport(image);
   }
 
   // Запуск предсказания — вызывается IO, когда картинка возле вьюпорта.
@@ -522,14 +547,20 @@
   // элементы, а не перекрашивают старые)
   let checkedBgElements = new WeakSet();
 
+  // Бюджет считается по НОВЫМ элементам, а не по позиции в документе:
+  // при `i < 3000` уже проверенные элементы съедали бы весь лимит, и на
+  // больших страницах фоны после 3000-го никогда не сканировались бы
+  const BG_SCAN_BUDGET = 1500;
+
   function scanComputedBackgrounds() {
     if (!settings.enabled || !contextValid) return;
     const candidates = document.querySelectorAll('div[class], a[class], span[class], section[class], li[class]');
-    const limit = Math.min(candidates.length, 3000);
-    for (let i = 0; i < limit; i++) {
+    let budget = BG_SCAN_BUDGET;
+    for (let i = 0; i < candidates.length && budget > 0; i++) {
       const el = candidates[i];
       if (checkedBgElements.has(el)) continue;
       checkedBgElements.add(el);
+      budget--;
       const rect = el.getBoundingClientRect();
       if (rect.width < MIN_IMAGE_SIZE || rect.height < MIN_IMAGE_SIZE) continue;
 
@@ -549,6 +580,10 @@
         if (url) classifyPseudoBackground(el, pseudo, url);
       }
     }
+
+    // Бюджет исчерпан, а непроверенные элементы остались — продолжаем
+    // следующей порцией, не блокируя главный поток надолго
+    if (budget === 0) setTimeout(scanComputedBackgrounds, 300);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -668,6 +703,7 @@
       if (!settings.enabled || !contextValid) return;
       scanComputedBackgrounds();
       scanForShadowRoots(document.documentElement);
+      pruneObservedImages();
     }, wait);
   }
 
@@ -815,15 +851,30 @@
       return;
     }
 
+    // Страховка от «страницы без картинок»: если настройки не придут за
+    // SETTINGS_TIMEOUT (спящий/упавший service worker), снимаем прячущий
+    // CSS. Фильтрация продолжится, когда ответ всё же придёт
+    let settingsArrived = false;
+    const hideBackstop = setTimeout(() => {
+      if (!settingsArrived) removeFilterCSS();
+    }, SETTINGS_TIMEOUT);
+
     try {
       const response = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
       if (response) settings = response;
+      settingsArrived = true;
     } catch (e) {
       if (e.message?.includes('Extension context invalidated')) {
+        clearTimeout(hideBackstop);
         handleContextInvalidated();
         return;
       }
+    } finally {
+      clearTimeout(hideBackstop);
     }
+
+    // Backstop мог уже снять CSS (ответ пришёл позже таймаута) — вернём
+    if (settings.enabled) injectFilterCSS();
 
     if (!settings.enabled) {
       // Фильтр выключен: обязательно убрать CSS, иначе все картинки

@@ -35,3 +35,7 @@ sourcecode/
 # Env files
 .env
 .env.local
+
+# Test artifacts
+build/test-page.html
+build/test-backstop.html

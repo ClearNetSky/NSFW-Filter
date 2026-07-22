@@ -68,7 +68,14 @@ async function ensureOffscreenDocument() {
     creatingOffscreen = null;
   }
 
-  // Send initial settings + persisted verdicts to offscreen
+  await sendOffscreenInit();
+  console.log('NSFW Filter: Offscreen document created (WebGPU, no sandbox)');
+}
+
+// Отправка настроек + сохранённых вердиктов в offscreen. Вызывается и после
+// создания документа, и в ответ на OFFSCREEN_READY (offscreen мог не успеть
+// зарегистрировать слушатель к моменту первой отправки). INIT идемпотентен
+async function sendOffscreenInit() {
   const settings = await readSettings();
   const stored = await chrome.storage.local.get(VERDICT_CACHE_KEY);
   chrome.runtime.sendMessage({
@@ -76,8 +83,6 @@ async function ensureOffscreenDocument() {
     settings,
     verdicts: stored[VERDICT_CACHE_KEY] ?? []
   }).catch(() => {});
-
-  console.log('NSFW Filter: Offscreen document created (WebGPU, no sandbox)');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -95,6 +100,14 @@ const VERDICT_CACHE_MAX = 3000;
 
 // Последовательная запись — параллельные merge теряли бы вердикты
 let verdictWriteChain = Promise.resolve();
+
+// Очистка ставится в ту же цепочку, что и записи: иначе уже запущенная
+// запись завершилась бы ПОСЛЕ remove() и вернула устаревшие вердикты
+function clearVerdictCache() {
+  verdictWriteChain = verdictWriteChain
+    .then(() => chrome.storage.local.remove(VERDICT_CACHE_KEY))
+    .catch(() => {});
+}
 
 function persistVerdicts(entries) {
   verdictWriteChain = verdictWriteChain.then(async () => {
@@ -171,6 +184,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  // Offscreen поднялся и просит настройки (см. handshake в offscreen.js)
+  if (message.type === 'OFFSCREEN_READY') {
+    sendOffscreenInit();
+    return;
+  }
+
   // Fresh verdicts from offscreen → persist to storage
   if (message.type === 'PERSIST_VERDICTS') {
     if (Array.isArray(message.entries) && message.entries.length > 0) {
@@ -196,7 +215,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Персистентный кэш вердиктов инвалидируем: чувствительность/модель
   // изменились, старые вердикты могли стать неверными
   if (message.type === 'SETTINGS_UPDATED') {
-    chrome.storage.local.remove(VERDICT_CACHE_KEY).catch(() => {});
+    clearVerdictCache();
     chrome.runtime.sendMessage({
       type: 'OFFSCREEN_SETTINGS_UPDATED',
       settings: message.settings
@@ -262,13 +281,15 @@ function updateStats(blocked, scanned, tabId) {
   }
 }
 
+// .catch обязателен: вкладка могла закрыться между вызовами, и тогда
+// эти промисы отклоняются, засоряя лог service worker'а
 function updateBadge(tabId, count) {
   if (count > 0) {
     const text = count > 99 ? '99+' : count.toString();
-    chrome.action.setBadgeText({ text, tabId });
-    chrome.action.setBadgeBackgroundColor({ color: '#e53935', tabId });
+    chrome.action.setBadgeText({ text, tabId }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: '#e53935', tabId }).catch(() => {});
   } else {
-    chrome.action.setBadgeText({ text: '', tabId });
+    chrome.action.setBadgeText({ text: '', tabId }).catch(() => {});
   }
 }
 
@@ -279,7 +300,7 @@ function updateBadge(tabId, count) {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'loading') {
     tabBlockCounts.delete(tabId);
-    chrome.action.setBadgeText({ text: '', tabId });
+    chrome.action.setBadgeText({ text: '', tabId }).catch(() => {});
     chrome.runtime.sendMessage({
       type: 'OFFSCREEN_TAB_UPDATE',
       tabIdUrl: { tabId: tab.id, tabUrl: tab.url || '' }

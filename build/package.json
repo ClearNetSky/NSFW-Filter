@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "build": "esbuild offscreen-entry.js --bundle --minify --format=iife --platform=browser --alias:@tensorflow/tfjs=./tfjs-shim.js --define:process.env.NODE_ENV=\\\"production\\\" --outfile=../lib/tfjs-nsfwjs-webgpu.min.js"
+    "build": "esbuild offscreen-entry.js --bundle --minify --format=iife --platform=browser --alias:@tensorflow/tfjs=./tfjs-shim.js --define:process.env.NODE_ENV=\\\"production\\\" --outfile=../lib/tfjs-nsfwjs-webgpu.min.js",
+    "test": "node test-bundle.js && node test-content.js",
+    "test:content": "node test-content.js"
   },
   "keywords": [],
   "author": "",
@@ -20,5 +22,8 @@
     "@tensorflow/tfjs-layers": "^4.22.0",
     "esbuild": "^0.27.4",
     "nsfwjs": "^4.3.0"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.0.0"
   }
 }

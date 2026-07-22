@@ -84,6 +84,17 @@ function schedulePersist(key, result) {
   }, 5000);
 }
 
+// Настройки изменились — вердикты, посчитанные со старым порогом, больше
+// не действительны. Без этого отложенная запись «воскресила» бы их в
+// storage уже ПОСЛЕ того, как background очистил персистентный кэш
+function dropPendingPersist() {
+  persistBuffer = [];
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+}
+
 // Ключ кэша: data URL бывают по 10–50КБ — хранить их как ключи Map
 // в кэше и requestMap расточительно (до ~25МБ на 500 записей).
 // Для длинных URL используем двойной FNV-1a хеш + длину (128 бит
@@ -616,6 +627,10 @@ async function loadModel() {
 
     model = loaded;
     console.log(`NSFW Offscreen: ${trainedModel} loaded and warm (backend: ${tf.getBackend()})`);
+    // Модель готова — разбираем всё, что накопилось за время загрузки.
+    // Обязательно и здесь: retry-путь (setTimeout ниже) иначе оставил бы
+    // буфер нетронутым даже после успешной повторной попытки
+    flushBuffered();
   } catch (error) {
     console.error('NSFW Offscreen: Model load failed:', error);
     loadAttempts++;
@@ -624,16 +639,10 @@ async function loadModel() {
     } else {
       // Модель так и не загрузилась — отвечаем fail-open всем буферизованным
       // запросам, иначе картинки на страницах останутся скрытыми
-      for (const { url, requestId } of buffered) {
-        chrome.runtime.sendMessage({
-          type: 'PREDICTION_RESULT',
-          requestId,
-          result: false,
-          url,
-          error: 'Model load failed'
-        }).catch(() => {});
+      const pending = buffered.splice(0, buffered.length);
+      for (const { url, requestId } of pending) {
+        respondFailOpen(url, requestId, 'Model load failed');
       }
-      buffered.length = 0;
     }
   }
 }
@@ -642,12 +651,29 @@ async function loadModel() {
 // MESSAGE HANDLING — from service worker
 // ═══════════════════════════════════════════════════════════════
 
-// Buffer predictions that arrive before model is ready
+// Buffer predictions that arrive before model is ready.
+// Кап: если модель так и не поднялась, буфер не должен расти бесконечно —
+// самым старым отвечаем fail-open (их всё равно уже закрыл failsafe в content)
 const buffered = [];
+const MAX_BUFFERED = 500;
+
+function respondFailOpen(url, requestId, reason) {
+  chrome.runtime.sendMessage({
+    type: 'PREDICTION_RESULT',
+    requestId,
+    result: false,
+    url,
+    error: reason
+  }).catch(() => {});
+}
 
 function dispatchPredict(url, requestId, tabIdUrl) {
   if (!model) {
     buffered.push({ url, requestId, tabIdUrl });
+    while (buffered.length > MAX_BUFFERED) {
+      const oldest = buffered.shift();
+      respondFailOpen(oldest.url, oldest.requestId, 'Model not ready (buffer overflow)');
+    }
     return;
   }
 
@@ -671,15 +697,24 @@ function dispatchPredict(url, requestId, tabIdUrl) {
     });
 }
 
+// КРИТИЧНО: сначала снимаем буфер, потом диспатчим. Иначе при model === null
+// dispatchPredict возвращает элементы обратно в тот же массив, а for...of
+// перечитывает length на каждом шаге → бесконечный цикл и намертво
+// зависший offscreen-документ (всё расширение перестаёт работать)
 function flushBuffered() {
-  for (const { url, requestId, tabIdUrl } of buffered) {
+  if (buffered.length === 0 || !model) return;
+  const pending = buffered.splice(0, buffered.length);
+  for (const { url, requestId, tabIdUrl } of pending) {
     dispatchPredict(url, requestId, tabIdUrl);
   }
-  buffered.length = 0;
 }
+
+let initReceived = false;
 
 chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   if (message.type === 'OFFSCREEN_INIT') {
+    if (initReceived) return; // повторный INIT (из handshake) — игнорируем
+    initReceived = true;
     Object.assign(settings, message.settings || {});
     // Сидируем LRU сохранёнными вердиктами (порядок сохранён: старые первыми)
     if (Array.isArray(message.verdicts)) {
@@ -689,6 +724,16 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
         }
       }
       console.log(`NSFW Offscreen: seeded ${message.verdicts.length} cached verdicts`);
+    }
+    // Настройки могли прийти уже после старта загрузки модели с дефолтом —
+    // если выбранная модель другая, перезагружаем
+    const wanted = settings.trainedModel || 'MobileNet_v2';
+    const wantedSize = wanted === 'InceptionV3' ? 299 : 224;
+    if (model && wantedSize !== modelSize) {
+      try { model.dispose?.(); } catch {}
+      model = null;
+      loadAttempts = 0;
+      loadModel();
     }
   }
 
@@ -713,6 +758,9 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   if (message.type === 'OFFSCREEN_SETTINGS_UPDATED') {
     const oldModel = settings.trainedModel;
     if (message.settings) Object.assign(settings, message.settings);
+    // Вердикты со старым порогом больше не действительны — и в памяти,
+    // и в ещё не отправленном буфере на сохранение
+    dropPendingPersist();
     // If model changed, reload it
     if (settings.trainedModel !== oldModel) {
       console.log(`NSFW Offscreen: Model changed ${oldModel} → ${settings.trainedModel}, reloading...`);
@@ -738,6 +786,12 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
 // ═══════════════════════════════════════════════════════════════
 
 tf.enableProdMode();
+
+// Handshake: OFFSCREEN_INIT, который background шлёт сразу после
+// createDocument, может не застать этот слушатель зарегистрированным.
+// Тогда offscreen работал бы с дефолтными настройками (порог 50) и без
+// сохранённого кэша — запрашиваем их сами, INIT идемпотентен
+chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' }).catch(() => {});
 
 (async () => {
   await initBackend();
