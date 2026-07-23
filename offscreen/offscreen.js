@@ -234,8 +234,12 @@ const loadingQueue = new ConcurrentQueue({
   concurrency: 100,
   timeout: 0,
   onProcess: ({ url, key, tabIdUrl }, callback) => {
-    // Skip if tab navigated away
-    if (tabIdUrl && tabIdUrl.tabId !== null) {
+    // Skip if tab navigated away — но ТОЛЬКО когда ждёт ровно одна вкладка.
+    // При дедупликации одного URL из нескольких вкладок tabIdUrl хранит
+    // лишь первого запросившего; если отменить по его навигации, отклонятся
+    // ВСЕ ожидающие, и в ещё открытых вкладках картинка покажется непроверенной
+    const waiters = requestMap.get(key);
+    if (tabIdUrl && tabIdUrl.tabId !== null && waiters && waiters.length === 1) {
       const currentUrl = currentTabIdUrls.get(tabIdUrl.tabId);
       if (currentUrl !== undefined && currentUrl !== tabIdUrl.tabUrl) {
         callback({ key, error: new Error('Tab navigated away') });
