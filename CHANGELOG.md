@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.3.3 — WebGPU Warm-up Fix
+
+### Критическое (производительность)
+- **Warm-up ВСЕГДА проваливался на WebGPU → все пользователи молча
+  откатывались на WebGL.** Прогрев прогонял `model.classify()` по голому
+  `<canvas>` без rendering-контекста, а WebGPU-бэкенд TF.js для такого canvas
+  падает в `copyExternalImageToTexture` («canvas without rendering context»).
+  Логика деградации считала это признаком нерабочего GPU и переключалась на
+  WebGL — терялось главное преимущество WebGPU-архитектуры (v2.0).
+  Реальная классификация при этом работала: она использует `ImageBitmap`,
+  ломался только warm-up-проба.
+  Теперь warm-up прогревается на `ImageBitmap` — ровно на том типе, что идёт
+  в проде, так что и compile-cache пайплайнов совпадает, и WebGPU принимает
+  источник. В логах исчезает `CopyExternalImageToTexture ... will return early`.
+
+---
+
 ## v2.3.2 — Full Audit: Critical Fixes & Regression Tests
 
 Полный аудит всех слоёв расширения. Найденные проблемы подтверждены

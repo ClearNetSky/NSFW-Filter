@@ -583,12 +583,30 @@ async function initBackend() {
 // на холодном GPU это секунды. Без прогрева эту цену платит ПЕРВАЯ реальная
 // картинка каждой сессии (пользователь видит «медленный старт»). Заодно это
 // валидация бэкенда: регистрация может пройти на GPU, который зависает на
-// настоящем графе — гоняем полный classify по пустому canvas с таймаутом
+// настоящем графе — гоняем полный classify с таймаутом.
+//
+// ВАЖНО: прогреваем именно на ImageBitmap, а не на голом canvas. WebGPU-
+// бэкенд TF.js для canvas без rendering-контекста падает в
+// copyExternalImageToTexture («canvas without rendering context»), из-за
+// чего warm-up ошибочно считал WebGPU нерабочим и ВСЕГДА откатывался на
+// WebGL. ImageBitmap — тот же тип, что идёт в проде, так что compile-cache
+// шейдеров/пайплайнов совпадает с реальным путём классификации
 async function warmUpModel(loadedModel) {
   const canvas = document.createElement('canvas');
   canvas.width = modelSize;
   canvas.height = modelSize;
-  await withTimeout(loadedModel.classify(canvas, 5), WARMUP_TIMEOUT, 'Model warm-up');
+  // Нужен контекст + пиксели, иначе createImageBitmap с пустого canvas
+  // на части движков даёт непригодный источник
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#808080';
+  ctx.fillRect(0, 0, modelSize, modelSize);
+
+  const bitmap = await createImageBitmap(canvas);
+  try {
+    await withTimeout(loadedModel.classify(bitmap, 5), WARMUP_TIMEOUT, 'Model warm-up');
+  } finally {
+    bitmap.close();
+  }
 }
 
 async function loadModel() {
