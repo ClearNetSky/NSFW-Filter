@@ -483,6 +483,18 @@
     classifyBackgroundUrl(el, url);
   }
 
+  // Восстанавливает ранее заблокированный фон. Для classed-фона достаточно
+  // снять наш inline-override 'none' — вернётся фон из CSS-класса. Но для
+  // ИНЛАЙНОВОГО фона мы при блокировке затёрли background-image значением
+  // none, потеряв исходный URL; возвращаем его из сохранённого dataset
+  function restoreBackground(el) {
+    const savedUrl = el.dataset.nsfwBgUrl;
+    el.style.removeProperty('background-image');
+    if (savedUrl && getComputedStyle(el).backgroundImage === 'none') {
+      el.style.backgroundImage = `url("${savedUrl}")`;
+    }
+  }
+
   // Общий вердикт для основного фона (inline и computed)
   function classifyBackgroundUrl(el, url) {
     requestPrediction(url)
@@ -785,60 +797,85 @@
   // ═══════════════════════════════════════════════════════════════
 
   chrome.runtime.onMessage.addListener((message) => {
-    if (message.type === 'SETTINGS_UPDATED') {
-      const wasEnabled = settings.enabled;
-      settings = message.settings;
+    if (message.type !== 'SETTINGS_UPDATED') return;
 
-      // Собираем все корни: документ + известные shadow roots
-      const allRoots = [document, ...knownShadowRoots];
+    const prev = settings;
+    settings = message.settings;
 
-      if (!settings.enabled) {
-        // Выключение: убираем CSS (иначе новые img будут невидимы)
-        // и разблокируем всё скрытое
-        removeFilterCSS();
-        for (const root of allRoots) {
-          root.querySelectorAll('img, video').forEach(el => {
-            el.dataset.nsfwFilterStatus = 'sfw';
-            el.style.visibility = '';
-            el.style.opacity = '';
-            if (el.parentNode?.nodeName === 'BODY') el.hidden = false;
-          });
-          // Восстанавливаем заблокированные фоны
-          root.querySelectorAll('[data-nsfw-bg-status="nsfw"]').forEach(el => {
-            el.style.removeProperty('background-image');
-            delete el.dataset.nsfwBgStatus;
-            delete el.dataset.nsfwBgUrl;
-          });
-          // И заблокированные pseudo-фоны
-          root.querySelectorAll('[data-nsfw-pseudo-blocked]').forEach(el => {
-            delete el.dataset.nsfwPseudoBlocked;
-          });
-        }
-      } else if (!wasEnabled) {
-        // Re-enable: reset all statuses and re-scan
-        injectFilterCSS();
-        for (const root of allRoots) {
-          root.querySelectorAll('img[data-nsfw-filter-status], video[data-nsfw-filter-status]').forEach(el => {
-            delete el.dataset.nsfwFilterStatus;
-          });
-          root.querySelectorAll('[data-nsfw-bg-url]').forEach(el => {
-            delete el.dataset.nsfwBgStatus;
-            delete el.dataset.nsfwBgUrl;
-          });
-        }
-        for (const sr of knownShadowRoots) injectShadowCSS(sr);
-        // Сбрасываем негативный кэш фонов — computed-скан пройдёт заново
-        checkedBgElements = new WeakSet();
-        // Если страница загрузилась с выключенным фильтром, init() вышел
-        // до запуска observer — стартуем наблюдение здесь (повторный
-        // observe того же target безопасен: опции просто заменяются)
-        observer.observe(document, OBSERVER_CONFIG);
-        findAndCheckAllImages(document.documentElement);
-        for (const sr of knownShadowRoots) findAndCheckAllImages(sr);
-        scanForShadowRoots(document.documentElement);
-        scanComputedBackgrounds();
+    // Собираем все корни: документ + известные shadow roots
+    const allRoots = [document, ...knownShadowRoots];
+
+    if (!settings.enabled) {
+      // Выключение: убираем CSS (иначе новые img будут невидимы)
+      // и разблокируем всё скрытое
+      removeFilterCSS();
+      for (const root of allRoots) {
+        root.querySelectorAll('img, video').forEach(el => {
+          el.dataset.nsfwFilterStatus = 'sfw';
+          el.style.visibility = '';
+          el.style.opacity = '';
+          if (el.parentNode?.nodeName === 'BODY') el.hidden = false;
+        });
+        // Восстанавливаем заблокированные фоны
+        root.querySelectorAll('[data-nsfw-bg-status="nsfw"]').forEach(el => {
+          restoreBackground(el);
+          delete el.dataset.nsfwBgStatus;
+          delete el.dataset.nsfwBgUrl;
+        });
+        // И заблокированные pseudo-фоны
+        root.querySelectorAll('[data-nsfw-pseudo-blocked]').forEach(el => {
+          delete el.dataset.nsfwPseudoBlocked;
+        });
       }
+      return;
     }
+
+    // Фильтр включён. Пересканируем, если (а) только что включили, или
+    // (б) изменилась чувствительность/модель — уже помеченные картинки
+    // надо переоценить по новому порогу (background параллельно чистит
+    // кэш вердиктов, так что повторные запросы дадут свежий результат).
+    // Без этого движение ползунка «ничего не делало» до перезагрузки
+    const needsRescan =
+      !prev.enabled ||
+      prev.sensitivity !== settings.sensitivity ||
+      prev.trainedModel !== settings.trainedModel;
+    if (!needsRescan) return;
+
+    // CSS должен быть на месте ДО снятия статусов, иначе непомеченные
+    // картинки на миг покажутся (NSFW-вспышка). injectFilterCSS идемпотентен
+    injectFilterCSS();
+    // Shadow-CSS не идемпотентен — переинжектим только при re-enable
+    // (при выключении removeFilterCSS их убрал); иначе плодили бы дубли
+    if (!prev.enabled) {
+      for (const sr of knownShadowRoots) injectShadowCSS(sr);
+    }
+
+    for (const root of allRoots) {
+      root.querySelectorAll('img[data-nsfw-filter-status], video[data-nsfw-filter-status]').forEach(el => {
+        delete el.dataset.nsfwFilterStatus;
+        el.style.visibility = ''; // снимаем наш inline-hide с ранее заблокированных
+      });
+      // Восстанавливаем ранее заблокированные фоны ДО переоценки — иначе
+      // ставший безопасным фон остался бы скрытым (background-image: none)
+      root.querySelectorAll('[data-nsfw-bg-url]').forEach(el => {
+        if (el.dataset.nsfwBgStatus === 'nsfw') restoreBackground(el);
+        delete el.dataset.nsfwBgStatus;
+        delete el.dataset.nsfwBgUrl;
+      });
+      root.querySelectorAll('[data-nsfw-pseudo-blocked]').forEach(el => {
+        delete el.dataset.nsfwPseudoBlocked;
+      });
+    }
+    // Сбрасываем негативный кэш фонов — computed-скан пройдёт заново
+    checkedBgElements = new WeakSet();
+
+    // Если страница загрузилась с выключенным фильтром, init() вышел до
+    // запуска observer — стартуем здесь (повторный observe безопасен)
+    observer.observe(document, OBSERVER_CONFIG);
+    findAndCheckAllImages(document.documentElement);
+    for (const sr of knownShadowRoots) findAndCheckAllImages(sr);
+    scanForShadowRoots(document.documentElement);
+    scanComputedBackgrounds();
   });
 
   // ═══════════════════════════════════════════════════════════════

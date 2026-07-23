@@ -4,8 +4,9 @@
   "main": "index.js",
   "scripts": {
     "build": "esbuild offscreen-entry.js --bundle --minify --format=iife --platform=browser --alias:@tensorflow/tfjs=./tfjs-shim.js --define:process.env.NODE_ENV=\\\"production\\\" --outfile=../lib/tfjs-nsfwjs-webgpu.min.js",
-    "test": "node test-bundle.js && node test-content.js",
-    "test:content": "node test-content.js"
+    "test": "node test-bundle.js && node test-content.js && node test-settings.js",
+    "test:content": "node test-content.js",
+    "test:settings": "node test-settings.js"
   },
   "keywords": [],
   "author": "",

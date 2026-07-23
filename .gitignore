@@ -39,3 +39,4 @@ sourcecode/
 # Test artifacts
 build/test-page.html
 build/test-backstop.html
+build/_settings-test-page.html
